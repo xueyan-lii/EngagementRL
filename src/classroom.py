@@ -27,7 +27,10 @@ from config.train_rl_model import (
 from src.vllm.data_parallel_vllm import ParallelvLLMInference, InferenceTask
 from src.utils.utils import check_equal, extract_answer
 from src.inference_providers.open_router_inference import OpenRouterInference
-from src.inference_providers.gemini_api_inference import GeminiInference
+try:
+    from src.inference_providers.gemini_api_inference import GeminiInference
+except ModuleNotFoundError:
+    GeminiInference = None  # gemini provider unused on this eval path
 import logging
 
 logger = logging.getLogger(__name__)
@@ -623,6 +626,7 @@ class Classroom:
                 model_path=teacher_model_cfg.model_name_or_path,
                 gpus_per_instance=teacher_model_cfg.vllm.number_of_gpus_per_instance,
                 gpu_memory_utilization=teacher_model_cfg.vllm.gpu_memory_utilization,
+                gpu_ids=teacher_model_cfg.vllm.gpu_ids,
                 max_model_len=teacher_model_cfg.vllm.max_length,
                 max_num_seqs=teacher_model_cfg.vllm.max_num_seqs,
                 model_save_path=model_save_path,
@@ -652,6 +656,7 @@ class Classroom:
                 model_path=student_model_cfg.model_name_or_path,
                 gpus_per_instance=student_model_cfg.vllm.number_of_gpus_per_instance,
                 gpu_memory_utilization=student_model_cfg.vllm.gpu_memory_utilization,
+                gpu_ids=student_model_cfg.vllm.gpu_ids,
                 max_model_len=student_model_cfg.vllm.max_length,
                 max_num_seqs=student_model_cfg.vllm.max_num_seqs,
                 model_save_path=None,
@@ -678,6 +683,7 @@ class Classroom:
                 model_path=judge_model_cfg.model_name_or_path,
                 gpus_per_instance=judge_model_cfg.vllm.number_of_gpus_per_instance,
                 gpu_memory_utilization=judge_model_cfg.vllm.gpu_memory_utilization,
+                gpu_ids=judge_model_cfg.vllm.gpu_ids,
                 max_model_len=judge_model_cfg.vllm.max_length,
                 max_num_seqs=judge_model_cfg.vllm.max_num_seqs,
                 model_save_path=None,
@@ -753,15 +759,19 @@ class Classroom:
                 logits[thinking_tokens[len(token_ids)]] = 10000
             return logits
 
-        self.sampling_params_teacher = SamplingParams(
+        # vllm 0.23 (V1) removed the SamplingParams(logits_processors=) kwarg.
+        # We only used it for force_thinking, which is off in this eval; omit it.
+        _teacher_sp_kwargs = dict(
             temperature=teacher_model_cfg.vllm.temperature,
             top_k=teacher_model_cfg.vllm.top_k,
             top_p=teacher_model_cfg.vllm.top_p,
             max_tokens=generation_cfg.max_tokens_per_turn,
-            logits_processors=(
-                [force_thinking_processor] if generation_cfg.force_thinking else []
-            ),
         )
+        if generation_cfg.force_thinking:
+            raise NotImplementedError(
+                "force_thinking needs the vllm V1 logits-processor API; unused here."
+            )
+        self.sampling_params_teacher = SamplingParams(**_teacher_sp_kwargs)
 
         self.conversation_sets = []
 

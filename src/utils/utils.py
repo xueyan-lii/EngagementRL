@@ -1,5 +1,8 @@
 import os
-import deepspeed
+try:
+    import deepspeed  # training-only; unused on the eval path
+except ModuleNotFoundError:
+    deepspeed = None
 import torch
 import logging
 import torch

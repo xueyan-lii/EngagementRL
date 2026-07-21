@@ -41,7 +41,10 @@ def sample_conversations(
                 CompletionOutput(
                     index=0,
                     text=tokenizer.apply_chat_template(results[i], tokenize=False),
-                    token_ids=tokenizer.apply_chat_template(results[i], tokenize=True),
+                    # transformers 5 returns a BatchEncoding dict by default
+                    token_ids=tokenizer.apply_chat_template(
+                        results[i], tokenize=True, return_dict=False
+                    ),
                     cumulative_logprob=0.0,
                     logprobs=[],
                 )

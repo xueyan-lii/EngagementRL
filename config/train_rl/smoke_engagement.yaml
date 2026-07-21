@@ -1,0 +1,87 @@
+# Smoke test: engagement-conditioned GRPO on Blackwell.
+# 2 problems x 4 rollouts, 2 optimizer steps. Trainer on GPUs 1,2 (via
+# CUDA_VISIBLE_DEVICES); server models pinned to absolute GPUs 3/4/7.
+
+train:
+  number_of_problems_per_batch: 2
+  num_samples_per_problem: 4
+  # batch 1: the unchunked GRPO loss materializes full-vocab logits
+  # (~7GB per 6k-token dialogue); 2 GPUs have no headroom for more.
+  per_device_train_batch_size: 1
+
+  learning_rate: 5e-7
+  # beta 0 skips the 14GB reference model; real runs: restore 0.001 and use
+  # 4 trainer GPUs (or use_liger_loss).
+  beta: 0.0
+  mu: 1
+  max_steps: 2
+  optimizer: adamw_torch          # bnb paged optimizer unverified on sm_120
+  gradient_checkpointing: true
+  save_policy_to_disk_every_n: 1  # exercise the weight-sync path every step
+
+teacher_model:
+  model_name_or_path: Qwen/Qwen2.5-7B-Instruct
+  vllm:
+    temperature: 1.0
+    top_k: 50
+    top_p: 1.0
+    max_length: 8192
+    max_num_seqs: 64
+    gpu_memory_utilization: 0.85
+    gpu_ids: [3]
+    load_and_unload: false
+    enable_sleep_mode: false
+    use_v0: false
+    enforce_eager: true
+
+engagement_model:
+  model_name_or_path: microsoft/UserLM-8b
+  vllm:
+    temperature: 1.0   # UserLM model card
+    top_p: 0.8
+    max_length: 8192
+    max_num_seqs: 64
+    gpu_memory_utilization: 0.85
+    gpu_ids: [4]
+    load_and_unload: false
+    enable_sleep_mode: false
+    use_v0: false
+    enforce_eager: true
+
+judge_model:
+  model_name_or_path: openai/gpt-oss-20b
+  vllm:
+    temperature: 1.0   # validated in engagement_eval (100% parse w/ retry)
+    top_k: -1
+    top_p: 1.0
+    max_length: 16384
+    max_num_seqs: 64
+    gpu_memory_utilization: 0.85
+    gpu_ids: [7]
+    load_and_unload: false
+    enable_sleep_mode: false
+    use_v0: false
+    enforce_eager: false
+
+reward:
+  engagement_weight: 0.5
+  learning_weight: 1.0
+
+dataset:
+  max_train_examples: 64
+
+generation:
+  max_turns: 8                   # short dialogues for the smoke test
+  max_tokens_per_turn: 512
+  max_tokens_in_conversation: 6000
+  max_tokens_per_judge_attempt: 1500
+  number_judge_attempts: 0       # no leakage/pedagogy judges at train time
+  use_thinking: true
+  forced_conversation_type: guided
+  server_port: 8006
+  use_experimental_shared_memory: false
+
+logging:
+  wandb: false
+  save_dir: checkpoints/smoke_engagement
+  save_steps: 50

@@ -39,10 +39,24 @@ class ParallelvLLMInference:
         use_v0: bool = False,
         logging_enabled: bool = False,
         log_file_path: Optional[str] = None,
+        gpu_ids: Optional[List[int]] = None,
+        userlm_mode: bool = False,
+        chat_template_kwargs: Optional[dict] = None,
     ):
         self.model_path = model_path
         self.model_save_path = model_save_path
         self.total_gpus = torch.cuda.device_count()
+        # gpu_ids: pin this model to exactly these GPU indices as a single
+        # resident instance (used to give each eval model its own GPU).
+        self.gpu_ids = list(gpu_ids) if gpu_ids is not None else None
+        # userlm_mode: render prompts with the model's chat template + a
+        # prepended BOS, then call .generate() (UserLM's template omits BOS).
+        self.userlm_mode = userlm_mode
+        # chat_template_kwargs: extra kwargs for llm.chat's template rendering
+        # (e.g. {"reasoning_effort": "low"} for gpt-oss judges).
+        self.chat_template_kwargs = chat_template_kwargs
+        if self.gpu_ids is not None:
+            gpus_per_instance = len(self.gpu_ids)
         self.gpus_per_instance = gpus_per_instance
         self.gpu_memory_utilization = gpu_memory_utilization
         self.max_model_len = max_model_len
@@ -100,6 +114,12 @@ class ParallelvLLMInference:
             self.n_instances = min(max_number_of_instances, self.n_instances)
             self.gpu_groups = self.gpu_groups[: self.n_instances]
             logger.info(f"Limiting number of instances to {self.n_instances}")
+
+        # Explicit GPU pinning: one resident instance on exactly self.gpu_ids.
+        if self.gpu_ids is not None:
+            self.gpu_groups = [list(self.gpu_ids)]
+            self.n_instances = 1
+            logger.info(f"Pinned single instance to GPUs {self.gpu_ids}")
 
         # Track last checkpoint ID seen
         self._last_reload_ckpt = None
@@ -197,6 +217,9 @@ class ParallelvLLMInference:
         return [out for _, out in sorted(results, key=lambda x: x[0])]
 
     def sleep(self):
+        # Resident mode: keep weights on-GPU, never offload.
+        if not self.load_and_unload:
+            return
         for q in self.task_queues:
             q.put("SLEEP")
         for q in self.result_queues:
@@ -236,16 +259,45 @@ class ParallelvLLMInference:
         meta: Optional[dict],
         counter: int,
     ):
-        if meta is not None:
+        # UserLM: its chat template omits the BOS its Llama-3.1 base expects, so
+        # render the template ourselves, prepend BOS, and use .generate().
+        if self.userlm_mode:
+            from vllm import TokensPrompt
+
+            tok = llm.get_tokenizer()
+            token_prompts = []
+            for msgs in prompts:
+                ids = tok.apply_chat_template(
+                    msgs, add_generation_prompt=True, tokenize=True, return_dict=False
+                )
+                if hasattr(ids, "input_ids"):  # BatchEncoding (transformers v5)
+                    ids = ids["input_ids"]
+                ids = list(ids)
+                if tok.bos_token_id is not None and (
+                    not ids or ids[0] != tok.bos_token_id
+                ):
+                    ids = [tok.bos_token_id] + ids
+                token_prompts.append(TokensPrompt(prompt_token_ids=ids))
+            return llm.generate(token_prompts, sampling_params=sampling_params)
+
+        chat_kwargs = (
+            {"chat_template_kwargs": self.chat_template_kwargs}
+            if self.chat_template_kwargs
+            else {}
+        )
+
+        # Empty meta ({}) means "no policy-weight reload" (the eval path); only the
+        # RL trainer passes a non-empty meta with shared-memory weight handles.
+        if meta:
             from ..utils.shared_memory import load_shared_state_dict
 
             state = load_shared_state_dict(meta).items()
             llm.llm_engine.model_executor.driver_worker.model_runner.model.load_weights(
                 state
             )
-            return llm.chat(prompts, sampling_params=sampling_params)
+            return llm.chat(prompts, sampling_params=sampling_params, **chat_kwargs)
 
-        return llm.chat(prompts, sampling_params=sampling_params)
+        return llm.chat(prompts, sampling_params=sampling_params, **chat_kwargs)
 
     def _worker_loop(
         self, gpu_group: List[int], task_queue, result_queue, inference_task
@@ -264,9 +316,11 @@ class ParallelvLLMInference:
 
         print(f"Worker on GPUs {gpu_group} initializing for task '{inference_task}'...")
 
+        # vllm 0.23 removed the `task=` kwarg (was on EngineArgs in 0.8.x).
+        # Generation is the default runner; our eval path is generate-only
+        # (reward_model="Answer" => no pooling model is ever loaded here).
         llm = LLM(
             model=self.model_path,
-            task=str(inference_task),
             tensor_parallel_size=self.gpus_per_instance,
             trust_remote_code=True,
             gpu_memory_utilization=self.gpu_memory_utilization,
@@ -300,7 +354,7 @@ class ParallelvLLMInference:
                 result_queue.put("SLEEP_DONE")
                 continue
 
-            if self.inference_task == InferenceTask.GENERATE:
+            if self.inference_task == InferenceTask.GENERATE and self.load_and_unload:
                 llm.wake_up()
 
             chunk, sampling_params, meta = task
@@ -334,7 +388,9 @@ class ParallelvLLMInference:
 
         destroy_model_parallel()
         destroy_distributed_environment()
-        del llm.llm_engine.model_executor
+        # vllm 0.23 renamed/removed LLMEngine.model_executor; tolerate its absence.
+        with contextlib.suppress(AttributeError):
+            del llm.llm_engine.model_executor
         del llm
         with contextlib.suppress(AssertionError):
             torch.distributed.destroy_process_group()

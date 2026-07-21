@@ -1,0 +1,90 @@
+# Full engagement-conditioned GRPO run.
+# GPUs (0/5/6 belong to other users): trainer on 1,2,3 (zero2/3ranks — Adam
+# fp32 state + ref model need the extra shard); teacher->4, UserLM+judge->7.
+# v1: beta=0.001 + scale_rewards=False after v0 policy collapse (no-KL +
+# std-normalized advantages amplified noise once rewards dipped).
+
+train:
+  number_of_problems_per_batch: 6   # x8 samples = 48 dialogues/step (divisible by 3 ranks)
+  num_samples_per_problem: 8        # GRPO group size (TutorRL value)
+  per_device_train_batch_size: 1    # full-vocab logits ~7GB per 6k-token seq
+
+  learning_rate: 5e-7
+  beta: 0.001   # KL anchor restored; beta=0 collapsed v0 at ~step 95
+  mu: 1
+  max_steps: 200
+  optimizer: adamw_torch
+  gradient_checkpointing: true
+  save_policy_to_disk_every_n: 1
+  batch_size_ref_model: 1   # ref logprob chunk of 4 seqs = 14GB fp32 logits -> OOM
+
+teacher_model:
+  model_name_or_path: Qwen/Qwen2.5-7B-Instruct
+  vllm:
+    temperature: 1.0
+    top_k: 50
+    top_p: 1.0
+    max_length: 8192
+    max_num_seqs: 64
+    gpu_memory_utilization: 0.85
+    gpu_ids: [4]
+    load_and_unload: false
+    enable_sleep_mode: false
+    use_v0: false
+    enforce_eager: true
+
+engagement_model:
+  model_name_or_path: microsoft/UserLM-8b
+  vllm:
+    temperature: 1.0   # UserLM model card
+    top_p: 0.8
+    max_length: 8192   # UserLM's max_position_embeddings cap
+    max_num_seqs: 64
+    gpu_memory_utilization: 0.30
+    gpu_ids: [7]
+    load_and_unload: false
+    enable_sleep_mode: false
+    use_v0: false
+    enforce_eager: true
+
+judge_model:
+  model_name_or_path: openai/gpt-oss-20b
+  vllm:
+    temperature: 1.0   # validated in engagement_eval (100% parse w/ retry)
+    top_k: -1
+    top_p: 1.0
+    max_length: 16384
+    max_num_seqs: 64
+    gpu_memory_utilization: 0.50
+    gpu_ids: [7]
+    load_and_unload: false
+    enable_sleep_mode: false
+    use_v0: false
+    enforce_eager: false
+
+reward:
+  engagement_weight: 0.5
+  learning_weight: 1.0
+
+dataset:
+  max_train_examples: -1   # full Big-Math train split, shuffled (seed 42)
+
+generation:
+  max_turns: 15                  # TutorRL / baseline value; room for learning
+  max_tokens_per_turn: 512
+  max_tokens_in_conversation: 4500  # caps logit memory so the ref model fits
+  max_tokens_per_judge_attempt: 1500
+  number_judge_attempts: 0       # no leakage/pedagogy judges at train time
+  use_thinking: true
+  forced_conversation_type: guided
+  server_port: 8006
+  use_experimental_shared_memory: false
+
+logging:
+  wandb: true
+  wandb_project: engagement-rl
+  wandb_run_name: qwen7b-userlm-gptoss-wE0.5-v1-kl
+  run_group: full
+  wandb_tags: ["full", "userlm", "gptoss-judge"]
+  save_dir: checkpoints/full_engagement_v1
+  save_steps: 40   # full ckpts are 114GB; 20-step cadence filled the disk

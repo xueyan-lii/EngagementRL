@@ -1,5 +1,5 @@
 from dataclasses import dataclass, field
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 
 @dataclass
@@ -28,6 +28,7 @@ class ModelvLLMConfig:
     number_of_gpus_per_instance: int = 4
     max_number_of_instances: int = -1
     from_0: bool = True
+    gpu_ids: Optional[List[int]] = None
 
     load_and_unload: bool = True
 

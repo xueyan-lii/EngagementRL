@@ -361,7 +361,8 @@ class ClassroomGRPOTrainer(Trainer):
         # "Could not estimate the number of tokens of the input, floating-point operations will not be computed." To
         # suppress this warning, we set the "estimate_tokens" key in the model's "warnings_issued" dictionary to True.
         # This acts as a flag to indicate that the warning has already been issued.
-        model.warnings_issued["estimate_tokens"] = True
+        if hasattr(model, "warnings_issued"):  # removed in transformers 5
+            model.warnings_issued["estimate_tokens"] = True
 
         # Initialize the metrics
         self._metrics = {"train": defaultdict(list)}
@@ -550,9 +551,11 @@ class ClassroomGRPOTrainer(Trainer):
                     "Unsupported input_ids dimensions: expected 1D or 2D tensor."
                 )
         else:
-            # Get the special tokens.
+            # Get the special tokens. return_dict=False: transformers 5 returns
+            # a BatchEncoding whose [0] is an Encoding object, which silently
+            # never matches a token id -> all-zero mask -> 0/0 NaN loss.
             start_token = self.processing_class.apply_chat_template(
-                [{"role": "system", "content": ""}]
+                [{"role": "system", "content": ""}], return_dict=False
             )[0]
             system_token = self.processing_class.encode("system")[0]
             user_token = self.processing_class.encode("user")[0]
@@ -807,7 +810,7 @@ class ClassroomGRPOTrainer(Trainer):
                 meta=meta_info_shared,
                 server_port=self.server_port,
                 num_samples_per_problem=self.num_generations,
-                tokenizer=self.tokenizer,
+                tokenizer=self.processing_class,  # .tokenizer removed in transformers 5
             )
             logger.info(f"Generated completions for {len(all_outputs)} prompts")
 
@@ -831,7 +834,11 @@ class ClassroomGRPOTrainer(Trainer):
                     pass
                 gc.collect()
                 torch.cuda.empty_cache()
-            time.sleep(2 * 60)
+            # Short grace period so the main rank's /sample_conversations
+            # request reaches the server first; wait_batch then blocks on the
+            # server's lock until the batch is done (and the NCCL gather below
+            # waits for rank 0 regardless), so a long sleep is pure overhead.
+            time.sleep(15)
             logger.info("Waiting for the batch to be ready")
             wait_batch(
                 server_port=self.server_port,
@@ -1119,9 +1126,15 @@ class ClassroomGRPOTrainer(Trainer):
 
         # We mask with assistant loss too.
         assistant_mask = self._compute_assistant_mask(completion_ids).int()[:, 1:]
-        loss = (per_token_loss * completion_mask * assistant_mask).sum() / (
-            assistant_mask * completion_mask
-        ).sum()
+        denom = (assistant_mask * completion_mask).sum()
+        if denom.item() == 0:
+            logger.error(
+                "Assistant mask is empty for the whole batch; loss would be "
+                "0/0=NaN. Check _compute_assistant_mask token matching."
+            )
+        loss = (per_token_loss * completion_mask * assistant_mask).sum() / denom.clamp(
+            min=1
+        )
         # loss = (per_token_loss * completion_mask).sum() / (completion_mask).sum()
 
         # Log the metrics

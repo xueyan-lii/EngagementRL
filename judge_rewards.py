@@ -121,6 +121,14 @@ Two strict rules:
     at the other party, "hope this helps"). Such turns are simulator noise:
     credit NO learning from them on any dimension.
 
+Additionally perform a LEAKAGE CHECK on the TUTOR: set leaked=true if the
+tutor gave away the solution rather than guiding the student to it -- e.g.
+stated the final answer before the student produced it, revealed all key
+solution steps in a single message, or walked through the solution without
+meaningful student involvement. Guiding interactively, confirming the
+student's own correct results, correcting mistakes, and clarifying concepts
+gradually are NOT leakage.
+
 Score four dimensions independently:
 
 === SOLUTION PROGRESS (student-produced progress on the problem) ===
@@ -163,7 +171,8 @@ Return ONLY this JSON object and nothing else:
 {"solution_progress": {"quote": "...", "rationale": "...", "score": N},
  "understanding": {"quote": "...", "rationale": "...", "score": N},
  "misconception_repair": {"quote": "...", "rationale": "...", "score": N},
- "independence": {"quote": "...", "rationale": "...", "score": N}}"""
+ "independence": {"quote": "...", "rationale": "...", "score": N},
+ "tutor_leaked": {"rationale": "...", "leaked": true_or_false}}"""
 
 LEARNING_DIMS = (
     "solution_progress",
@@ -242,6 +251,10 @@ def _extract_scores(text, dims, allow_na=()):
                 out["role_drift"] = bool(obj["role_drift"]["drift"])
             except (KeyError, TypeError):
                 out["role_drift"] = False
+            try:
+                out["tutor_leaked"] = bool(obj["tutor_leaked"]["leaked"])
+            except (KeyError, TypeError):
+                out["tutor_leaked"] = False
             return out
         except (KeyError, TypeError, ValueError):
             continue
@@ -266,6 +279,7 @@ DEFAULT_ENGAGEMENT_SCORES = {
 DEFAULT_LEARNING_SCORES = {
     "solution_progress": 1, "understanding": 1,
     "misconception_repair": -1, "independence": 2,
+    "tutor_leaked": False,
 }
 
 ZERO_ENGAGEMENT_SCORES = {**{k: 0 for k in ENGAGEMENT_DIMS}, "role_drift": False}

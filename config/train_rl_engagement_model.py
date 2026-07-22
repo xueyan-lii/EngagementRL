@@ -13,6 +13,9 @@ class EngagementRewardConfig:
     # With GRPO group-normalization only the ratio matters (the Pareto knob).
     engagement_weight: float = 0.5
     learning_weight: float = 1.0
+    # Multiplier applied to the learning reward when the terminal judge flags
+    # tutor leakage (tutor_leaked). 0.0 = leaking forfeits all learning credit.
+    leak_multiplier: float = 0.0
 
 
 @dataclass

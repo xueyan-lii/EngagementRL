@@ -71,6 +71,11 @@ def sample_conversations(request: ConversationSampleRequest):
         for t in c.turn_scores
         if t.get("role_drift", False)
     )
+    leaked = sum(
+        1
+        for c in conversations
+        if getattr(c, "learning_scores", {}).get("tutor_leaked", False)
+    )
 
     # Persist every rollout batch (full turns + judge scores) for inspection.
     dump_dir = os.path.join(config.logging.save_dir, "dialogues")
@@ -89,6 +94,9 @@ def sample_conversations(request: ConversationSampleRequest):
                         "disengage_reason": c.disengage_reason,
                         "role_drifted": c.role_drifted,
                         "drift_resamples": c.drift_resamples,
+                        "tutor_leaked": getattr(c, "learning_scores", {}).get(
+                            "tutor_leaked", False
+                        ),
                         "conversation": c.conversation,
                         "turn_scores": c.turn_scores,
                         "learning_scores": c.learning_scores,
@@ -106,7 +114,7 @@ def sample_conversations(request: ConversationSampleRequest):
         f"learning mean {sum(lea)/len(lea):.3f}, "
         f"disengaged {sum(dis)}/{len(dis)}, "
         f"drift: {drift_resamples} resamples, {drift_trunc} truncated, "
-        f"{judge_drift} judge-flagged turns"
+        f"{judge_drift} judge-flagged turns, leaked {leaked}/{len(conversations)}"
     )
 
     if config.logging.wandb:
@@ -133,6 +141,7 @@ def sample_conversations(request: ConversationSampleRequest):
                 "server/drift_truncation_rate": drift_trunc / len(conversations),
                 "server/drift_resamples": drift_resamples,
                 "server/judge_flagged_drift_turns": judge_drift,
+                "server/leak_rate": leaked / len(conversations),
             }
         )
 
@@ -187,6 +196,7 @@ def main(cfg: TrainEngagementRLConfig):
         judge_model_cfg=cfg.judge_model,
         generation_cfg=cfg.generation,
         model_save_path=os.path.join(cfg.logging.save_dir, "policy"),
+        leak_multiplier=cfg.reward.leak_multiplier,
     )
 
     uvicorn.run(app, host="0.0.0.0", port=cfg.generation.server_port)

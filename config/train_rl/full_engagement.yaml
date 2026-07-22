@@ -65,6 +65,7 @@ judge_model:
 reward:
   engagement_weight: 0.5
   learning_weight: 1.0
+  leak_multiplier: 0.0   # judge flags tutor_leaked -> learning reward x this
 
 dataset:
   max_train_examples: -1   # full Big-Math train split, shuffled (seed 42)
@@ -83,8 +84,8 @@ generation:
 logging:
   wandb: true
   wandb_project: engagement-rl
-  wandb_run_name: qwen7b-userlm-gptoss-wE0.5-v2-antihack
+  wandb_run_name: qwen7b-userlm-gptoss-wE0.5-v3-leakgate
   run_group: full
   wandb_tags: ["full", "userlm", "gptoss-judge"]
-  save_dir: checkpoints/full_engagement_v2
+  save_dir: checkpoints/full_engagement_v3
   save_steps: 40   # full ckpts are 114GB; 20-step cadence filled the disk

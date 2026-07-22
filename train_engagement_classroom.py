@@ -98,6 +98,7 @@ class TrainEngagementClassroom(Classroom):
         generation_cfg,
         model_save_path,
         log_file_path=None,
+        leak_multiplier=0.0,
     ):
         # NOTE: deliberately NOT calling Classroom.__init__ (no student probe /
         # reward model at train time). Only the three models below are loaded.
@@ -105,6 +106,7 @@ class TrainEngagementClassroom(Classroom):
         self.engagement_model_cfg = engagement_model_cfg
         self.judge_model_cfg = judge_model_cfg
         self.generation_cfg = generation_cfg
+        self.leak_multiplier = leak_multiplier
 
         self.teacher_model = ParallelvLLMInference(
             model_path=teacher_model_cfg.model_name_or_path,
@@ -400,10 +402,15 @@ class TrainEngagementClassroom(Classroom):
         return engagement_scalar(getattr(conversation, "turn_scores", []))
 
     def get_learning_reward(self, conversation: Conversation) -> float:
+        scores = getattr(conversation, "learning_scores", None)
+        raw = learning_scalar(scores)
+        # Leak gate: a tutor that gives the solution away forfeits learning
+        # credit (multiplier configurable via reward.leak_multiplier).
+        if scores is not None and scores.get("tutor_leaked", False):
+            raw *= self.leak_multiplier
         # Participation gate (discrete stand-in for the paper's survival
         # factor): learning only counts if the real student took part.
         # 0 non-empty student turns -> 0, 1 -> half credit, >=2 -> full.
-        raw = learning_scalar(getattr(conversation, "learning_scores", None))
         n_real = sum(
             1
             for m in conversation.conversation

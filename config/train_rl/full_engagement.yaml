@@ -83,8 +83,8 @@ generation:
 logging:
   wandb: true
   wandb_project: engagement-rl
-  wandb_run_name: qwen7b-userlm-gptoss-wE0.5-v1-kl
+  wandb_run_name: qwen7b-userlm-gptoss-wE0.5-v2-antihack
   run_group: full
   wandb_tags: ["full", "userlm", "gptoss-judge"]
-  save_dir: checkpoints/full_engagement_v1
+  save_dir: checkpoints/full_engagement_v2
   save_steps: 40   # full ckpts are 114GB; 20-step cadence filled the disk

@@ -156,11 +156,19 @@ class TrainEngagementClassroom(Classroom):
             chat_template_kwargs={"reasoning_effort": "low"},
         )
 
+        # Stop the teacher the moment it starts scripting a fake student
+        # line inside its own turn (reward hack found in v1: fabricated
+        # "User: ..." exchanges fooled the learning judge while the real
+        # student never spoke).
         self.sampling_params_teacher = SamplingParams(
             temperature=teacher_model_cfg.vllm.temperature,
             top_k=teacher_model_cfg.vllm.top_k,
             top_p=teacher_model_cfg.vllm.top_p,
             max_tokens=generation_cfg.max_tokens_per_turn,
+            stop=[
+                "\nUser:", "\nStudent:", "\nHuman:", "\nLearner:",
+                "\nuser:", "\nstudent:",
+            ],
         )
         # UserLM per its model card; both <|eot_id|> and <|endconversation|>
         # must stop generation or the model drifts into assistant-style text.
@@ -392,4 +400,13 @@ class TrainEngagementClassroom(Classroom):
         return engagement_scalar(getattr(conversation, "turn_scores", []))
 
     def get_learning_reward(self, conversation: Conversation) -> float:
-        return learning_scalar(getattr(conversation, "learning_scores", None))
+        # Participation gate (discrete stand-in for the paper's survival
+        # factor): learning only counts if the real student took part.
+        # 0 non-empty student turns -> 0, 1 -> half credit, >=2 -> full.
+        raw = learning_scalar(getattr(conversation, "learning_scores", None))
+        n_real = sum(
+            1
+            for m in conversation.conversation
+            if m["role"] == "student" and m["content"].strip()
+        )
+        return raw * min(1.0, n_real / 2.0)

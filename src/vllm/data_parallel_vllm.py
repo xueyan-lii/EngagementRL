@@ -160,9 +160,25 @@ class ParallelvLLMInference:
             p.start()
             self.processes.append(p)
 
-        # Wait for each worker to signal "READY"
-        for q in self.result_queues:
-            q.get()
+        # Wait for each worker to signal "READY" -- fail fast instead of
+        # hanging forever if a worker dies before ever sending it (e.g. a
+        # model-loading crash). Without this, a dead worker leaves the
+        # server hung indefinitely on this call, silently burning a full
+        # GPU allocation instead of exiting so the job can be resubmitted.
+        for idx, q in enumerate(self.result_queues):
+            p = self.processes[idx]
+            while True:
+                try:
+                    q.get(timeout=1.0)
+                    break
+                except Empty:
+                    if not p.is_alive():
+                        raise RuntimeError(
+                            f"Worker {idx} (GPUs {self.gpu_groups[idx]}) died "
+                            f"during startup with exit code {p.exitcode} "
+                            "before signaling READY -- see its stderr above "
+                            "for the actual crash."
+                        )
 
     def _reload_workers(self):
         latest = self._get_latest_checkpoint_id()
@@ -205,13 +221,26 @@ class ParallelvLLMInference:
         received = 0
         expected = total
         while received < expected:
-            for q in self.result_queues:
+            for i, q in enumerate(self.result_queues):
                 try:
                     batch = q.get(block=True, timeout=0.1)
                     if batch not in ("READY", "SLEEP_DONE"):
                         results.extend(batch)
                         received += len(batch)
                 except Empty:
+                    # A dead worker will never produce the rest of its
+                    # chunk -- raise instead of spinning on this Empty
+                    # forever. This propagates as a 500 to the trainer's
+                    # HTTP call, which crashes the trainer and (running in
+                    # the foreground under `set -euo pipefail`) ends the
+                    # whole job instead of it hanging until manually killed.
+                    if not self.processes[i].is_alive():
+                        raise RuntimeError(
+                            f"Worker {i} (GPUs {self.gpu_groups[i]}) died "
+                            f"with exit code {self.processes[i].exitcode} "
+                            "mid-batch -- see its stderr above for the "
+                            "actual crash."
+                        )
                     continue
 
         return [out for _, out in sorted(results, key=lambda x: x[0])]

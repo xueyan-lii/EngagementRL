@@ -8,6 +8,7 @@ from dotenv import load_dotenv
 
 from src.classroom import Classroom, JudgeDecision
 from utils.data import load_datasets
+from utils.transfer_test import load_sibling_pool, select_siblings
 from config.eval import EvalConfig
 from src.utils.utils import init_logger
 
@@ -52,6 +53,9 @@ def main(cfg: EvalConfig):
     _, eval_data = load_datasets(cfg.dataset, cfg.seed)
     print(eval_data)
 
+    # Captured before slicing eval_data down to problem/answer below.
+    _domains_we_sample = eval_data["domain"]
+    _solve_rates_we_sample = eval_data["llama8b_solve_rate"]
     _problems_we_sample = eval_data["problem"]
     _answers_we_sample = eval_data["answer"]
 
@@ -63,11 +67,45 @@ def main(cfg: EvalConfig):
         problem_we_sample.extend([_problems_we_sample[i]] * number_of_times_to_average)
         answer_we_sample.extend([_answers_we_sample[i]] * number_of_times_to_average)
 
+    logger.info("Selecting transfer-test sibling problems...")
+    dataset_name = cfg.dataset.eval_datasets[0].name_or_path
+    sibling_pool = load_sibling_pool(
+        dataset_name, exclude_problems=set(_problems_we_sample)
+    )
+    sibling_problems, sibling_answers, sibling_fallback = select_siblings(
+        _problems_we_sample,
+        _domains_we_sample,
+        _solve_rates_we_sample,
+        sibling_pool,
+        cfg.seed,
+    )
+    n_domain_fallback = sum(1 for t in sibling_fallback if t.startswith("no-domain"))
+    logger.info(
+        f"Sibling selection: {n_domain_fallback}/{len(_problems_we_sample)} problems "
+        "had no same-domain match within tolerance and fell back to difficulty-only matching."
+    )
+    sibling_we_sample, sibling_answer_we_sample = [], []
+    for i in range(len(_problems_we_sample)):
+        sibling_we_sample.extend([sibling_problems[i]] * number_of_times_to_average)
+        sibling_answer_we_sample.extend(
+            [sibling_answers[i]] * number_of_times_to_average
+        )
+
     logger.info("Sampling conversations...")
     conversations = classroom.sample_conversations(
         problem_we_sample,
         answer_we_sample,
         compute_initial_attempt=cfg.recompute_initial_attempts,
+    )
+
+    logger.info("Running transfer test (treatment: sibling solved in-context)...")
+    classroom.run_transfer_test(
+        conversations, sibling_we_sample, sibling_answer_we_sample
+    )
+
+    logger.info("Running transfer test (control: sibling solved cold)...")
+    control_rewards = classroom.compute_cold_solve_rewards(
+        sibling_we_sample, sibling_answer_we_sample
     )
 
     logger.info("Computing metrics...")
@@ -158,6 +196,46 @@ def main(cfg: EvalConfig):
     )
     print(f"Does not follow pedagogical values mean: {does_not_follow_mean}")
 
+    # Transfer test: sibling problem solved in-context after the dialogue
+    # (treatment) vs. solved cold with no dialogue at all (control).
+    transfer_treatment_scores = []
+    for i in range(len(_problems_we_sample)):
+        current = []
+        for j in range(number_of_times_to_average):
+            r = conversations[
+                i * number_of_times_to_average + j
+            ].get_transfer_rm_reward()
+            if r is not None:
+                current.append(r)
+        if current:
+            transfer_treatment_scores.append(sum(current) / len(current))
+    transfer_treatment_mean = sum(transfer_treatment_scores) / len(
+        transfer_treatment_scores
+    )
+
+    transfer_control_scores = []
+    for i in range(len(_problems_we_sample)):
+        current = [
+            r
+            for r in control_rewards[
+                i * number_of_times_to_average : (i + 1) * number_of_times_to_average
+            ]
+            if r is not None
+        ]
+        if current:
+            transfer_control_scores.append(sum(current) / len(current))
+    transfer_control_mean = sum(transfer_control_scores) / len(transfer_control_scores)
+
+    transfer_delta_mean = transfer_treatment_mean - transfer_control_mean
+    print(f"Transfer sibling solve rate (cold, no dialogue): {transfer_control_mean}")
+    print(
+        f"Transfer sibling solve rate (after dialogue, in-ctx): {transfer_treatment_mean}"
+    )
+    print(f"Transfer Delta: {transfer_delta_mean}")
+    print(
+        f"Domain-match fallback (difficulty-only): {n_domain_fallback}/{len(_problems_we_sample)}"
+    )
+
     df_table = classroom.to_pd_latest()
 
     if cfg.score_using_pedagogical_reward:
@@ -196,6 +274,9 @@ def main(cfg: EvalConfig):
                 "rejects_pedagogical_values_mean": does_not_follow_mean,
                 "pedagogical_reward_macro_avg": pedagogical_reward_macro_avg,
                 "pedagogical_reward_micro_avg": pedagogical_reward_micro_avg,
+                "transfer_control_mean": transfer_control_mean,
+                "transfer_treatment_mean": transfer_treatment_mean,
+                "transfer_delta_mean": transfer_delta_mean,
             }
         )
 

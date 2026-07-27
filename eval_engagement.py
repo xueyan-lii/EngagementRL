@@ -15,6 +15,7 @@ from dotenv import load_dotenv
 from engagement_classroom import EngagementClassroom
 from src.classroom import JudgeDecision
 from utils.data import load_datasets
+from utils.transfer_test import load_sibling_pool, select_siblings
 from config.eval import EvalConfig
 from config.train_rl_model import StudentModelConfig
 from src.utils.utils import init_logger
@@ -48,6 +49,18 @@ def _macro_mean(conversations, n_problems, n_samples, fn):
     return sum(vals) / len(vals) if vals else float("nan")
 
 
+def _macro_mean_list(values, n_problems, n_samples):
+    """Same nested-averaging shape as _macro_mean, but over a flat list of
+    scalars already aligned to the sample_problems/sample_answers ordering,
+    rather than a per-conversation callback."""
+    vals = []
+    for i in range(n_problems):
+        cur = [v for v in values[i * n_samples : (i + 1) * n_samples] if v is not None]
+        if cur:
+            vals.append(sum(cur) / len(cur))
+    return sum(vals) / len(vals) if vals else float("nan")
+
+
 @hydra.main(config_path="config/eval", version_base=None)
 def main(cfg):
     cfg = OmegaConf.merge(OmegaConf.structured(EngagementEvalConfig), cfg)
@@ -63,6 +76,9 @@ def main(cfg):
     )
 
     _, eval_data = load_datasets(cfg.dataset, cfg.seed)
+    # Capture domain/difficulty metadata before eval_data gets sliced down to
+    # plain problem/answer lists below -- needed for sibling selection.
+    domains, solve_rates = eval_data["domain"], eval_data["llama8b_solve_rate"]
     problems, answers = eval_data["problem"], eval_data["answer"]
     n_problems = len(problems)
     n_samples = cfg.num_samples_per_problem
@@ -72,9 +88,35 @@ def main(cfg):
         sample_problems.extend([problems[i]] * n_samples)
         sample_answers.extend([answers[i]] * n_samples)
 
+    logger.info("Selecting transfer-test sibling problems...")
+    dataset_name = cfg.dataset.eval_datasets[0].name_or_path
+    sibling_pool = load_sibling_pool(dataset_name, exclude_problems=set(problems))
+    sibling_problems, sibling_answers, sibling_fallback = select_siblings(
+        problems, domains, solve_rates, sibling_pool, cfg.seed
+    )
+    n_domain_fallback = sum(1 for t in sibling_fallback if t.startswith("no-domain"))
+    logger.info(
+        f"Sibling selection: {n_domain_fallback}/{n_problems} problems had no "
+        "same-domain match within tolerance and fell back to difficulty-only matching."
+    )
+    sample_sibling_problems, sample_sibling_answers = [], []
+    for i in range(n_problems):
+        sample_sibling_problems.extend([sibling_problems[i]] * n_samples)
+        sample_sibling_answers.extend([sibling_answers[i]] * n_samples)
+
     logger.info("Sampling conversations (UserLM student)...")
     conversations = classroom.sample_conversations(
         sample_problems, sample_answers, compute_initial_attempt=True
+    )
+
+    logger.info("Running transfer test (treatment: sibling solved in-context)...")
+    classroom.run_transfer_test(
+        conversations, sample_sibling_problems, sample_sibling_answers
+    )
+
+    logger.info("Running transfer test (control: sibling solved cold)...")
+    control_rewards = classroom.compute_cold_solve_rewards(
+        sample_sibling_problems, sample_sibling_answers
     )
 
     logger.info("Computing metrics...")
@@ -91,6 +133,16 @@ def main(cfg):
         return d.count(JudgeDecision.REJECT) / len(d) if d else None
 
     leaked_mean = _macro_mean(conversations, n_problems, n_samples, leaked)
+
+    # Transfer test: sibling problem solved in-context after the dialogue
+    # (treatment) vs. solved cold with no dialogue at all (control). Isolates
+    # genuine transferable learning from same-problem leak/memorization
+    # inflation, since the sibling has different numbers/surface form.
+    transfer_treatment = _macro_mean(
+        conversations, n_problems, n_samples, lambda c: c.get_transfer_rm_reward()
+    )
+    transfer_control = _macro_mean_list(control_rewards, n_problems, n_samples)
+    transfer_delta = transfer_treatment - transfer_control
 
     # Engagement metrics
     disengaged_flags = [getattr(c, "disengaged", False) for c in conversations]
@@ -127,6 +179,15 @@ def main(cfg):
     print(f"  - via silence (blank)    : {n_silence}/{len(conversations)}", flush=True)
     print(f"Avg dialog length (msgs)   : {avg_turns:.2f}", flush=True)
     print(f"Avg turns-to-disengagement : {avg_disengage_turn:.2f}", flush=True)
+
+    print("--- Transfer test (sibling problem, same domain/difficulty) ---", flush=True)
+    print(f"Sibling solve rate (cold, no dialogue)      : {transfer_control:.4f}", flush=True)
+    print(f"Sibling solve rate (after dialogue, in-ctx) : {transfer_treatment:.4f}", flush=True)
+    print(f"Transfer Delta                              : {transfer_delta:+.4f}", flush=True)
+    print(
+        f"Domain-match fallback (difficulty-only)     : {n_domain_fallback}/{n_problems}",
+        flush=True,
+    )
 
     # Split Delta Solve Rate by engaged vs disengaged subpopulation (per-conv;
     # valid because num_samples_per_problem is 1). Pins the causal mechanism:

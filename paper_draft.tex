@@ -1,0 +1,991 @@
+\documentclass[11pt]{article}
+
+\usepackage[utf8]{inputenc}
+\usepackage{amsmath,amssymb}
+\usepackage{booktabs}
+\usepackage{graphicx}
+\usepackage{xcolor}
+\usepackage[margin=1in]{geometry}
+\usepackage{hyperref}
+\hypersetup{colorlinks=true,linkcolor=blue,citecolor=blue,urlcolor=blue}
+
+
+\newcommand{\cit}[1]{\textcolor{blue}{[\textsf{cite:#1}]}}
+\newcommand{\todo}[1]{\textcolor{red}{[TODO: #1]}}
+
+\title{Engagement-Conditioned RL for LLM Tutoring / no engagement, no learning: engagement-driven llm tutoring }
+\author{
+}
+\date{}
+
+\begin{document}
+\maketitle
+
+% =====================================================================
+\begin{abstract}
+\end{abstract}
+
+% =====================================================================
+\section{Introduction}
+\label{sec:intro}
+
+Large language models (LLMs) are used as tutors that uses pedagogy rather than direct question answering. They are trained to \emph{strategically withhold answers}, and guide students through Socratic questioning and scaffolding \cit{tutorrl}. 
+These methods are optimized against a \emph{simulated} student: a frozen LLM that plays
+the learner during learning and at evaluation time. 
+Similarly a lot of other user interaction studies uses pretrained assistant LLMs as the user, which is limited in how well they represent actual user behavior \cit{}. User models have been trained on user data to simulate user behavior in dialogue systems \cit{}, however, there is a lack of user models that specifically represent student behavior with learning as the main motivation, which is still different from the behavior of a generic user model.
+
+A critical and unrealistic assumption when using an assistant language models as a student is that they \emph{always engages}. The student never loses patience, never demands the answer, and never ends the conversation; only the tutor
+may terminate a dialogue. Real users do not behave this way. 
+User-simulator models trained on naturalistic chat data (e.g.\ UserLM \cit{userlm}, trained on
+WildChat \cit{wildchat}) exhibit short turns, impatience, and frequent disengagement. 
+This is in line with real student behavior in classroom settings where engagement is not an assumption that can be made trivially \cit{some social/education papers/khan academy aimecon25}.
+A tutor that withholds answers can be pedagogically optimal in expectation \emph{only if the student stays}; if the student leaves, no learning occurs.
+
+We propose \textbf{engagement-conditioned tutoring}: rather than maximizing learning under the assumption of an infinitely interested student, we maximize the \emph{expected learning gain achieved while the student remains engaged},
+\[
+  \max_{\pi}\; \mathbb{E}\big[\text{learning outcome before the student leaves}\big].
+\]
+This reframes tutoring as a multi-objective problem in which the tutor must
+trade off pedagogical pressure (which improves learning outcome but risks
+disengagement) against engagement (which keeps the student present long enough to
+learn). 
+%A key enabler is that \emph{engagement is cheap to measure per turn}: the probability that the simulated user ends the conversation, $P(\langle \textsc{end}\rangle)$, is directly available from the user-simulator's next-token distribution, giving a dense, per-turn reward signal. 
+We optimize the tutor with GRPO using a reward that combines per-turn engagement signal with a terminal learning-gain reward (Section~\ref{sec:method}).
+
+Our contributions are: (i) we show that a state-of-the-art pedagogically-aligned tutor degrades substantially when its assistant-LLM-as-student is replaced by a realistic user simulator (Section~\ref{sec:motivation}); 
+(ii) we introduce engagement-conditioned GRPO, which treats per-turn disengagement probability as a reward and targets expected learning-while-engaged (Section~\ref{sec:method}); 
+and (iii) \todo{method results}.
+
+\todo{jakub: frame it around 2-3 RQs. rq1: show the problem that current models and datasets assume high student engagement. rq2: answer how adding various engagement rewards can help to mitigate this issue. rq3: how to train reliable student models.}
+
+% =====================================================================
+\section{Defining Engagement}
+\label{sec:defining-engagement}
+
+%fredricks2004school https://journals.sagepub.com/doi/10.3102/00346543074001059
+%skinner2009motivational https://journals.sagepub.com/doi/10.1177/0013164408323233
+%chi2014icap https://education.asu.edu/sites/g/files/litvpz656/files/lcl/chiwylie2014icap_2.pdf
+%demszky2021uptake https://aclanthology.org/2021.acl-long.130/
+%hidi2006interest https://www.tandfonline.com/doi/abs/10.1207/s15326985ep4102_4
+
+Learner engagement is defined in three categories in literature \cit{fredricks2004school, skinner2009motivational}:
+\textbf{behavioral} engagement (participation, effort, persistence, staying on task), 
+\textbf{emotional/affective} engagement (interest, curiosity, enjoyment vs.\ boredom and frustration), 
+and \textbf{cognitive} engagement (depth of processing and investment in understanding beyond what is handed
+over). 
+Each dimension has a well-studied negative side, \emph{disaffection}: giving up and withdrawing (behavioral), boredom and alienation (emotional), and shallow or rote processing (cognitive) \cit{skinner1993motivation}. 
+
+Two refinements matter for tutoring dialogue.
+First, the ICAP framework \cit{chi2014icap} operationalizes \emph{cognitive} engagement through observable behavior, ordering learner activity as
+Interactive $>$ Constructive $>$ Active $>$ Passive, with higher modes producing more learning; 
+a closely related dialogue-level notion is \emph{uptake}, the degree to which a speaker builds on the interlocutor's
+contribution \cit{demszky2021uptake}. 
+Second, work on affect during learning with intelligent tutoring systems \cit{dmello2012affect, baker2010better} shows that \emph{confusion and even frustration are not
+disengagement}, they frequently co-occur with productive effort, 
+whereas boredom is the affective state that predicts checking out. 
+Situational \emph{interest} is the standard proxy for the emotional dimension \cit{hidi2006interest}.
+
+\begin{table}[h]
+\centering
+\begin{tabular}{|l|p{7cm}|p{7cm}|}
+\hline
+\textbf{Dimension} & \textbf{Definition} & \textbf{Its opposite (disaffection)} \\
+\hline
+\textbf{Behavioral} & participation, effort, persistence, on-task attention, staying present & passivity, giving up, withdrawal, demanding the answer, leaving \\
+\hline
+\textbf{Emotional} & interest, enthusiasm, enjoyment, curiosity & boredom, frustration, anxiety, indifference \\
+\hline
+\textbf{Cognitive} & deep processing, self-regulation, effortful reasoning, going beyond what's given & shallow/rote processing, just wanting to be told \\
+\hline
+\end{tabular}
+\caption{Dimensions of engagement and disaffection}
+\end{table}
+
+We use three operationalizations of (dis)engagement, in increasing order of construct coverage and decreasing order of cheapness:
+\begin{enumerate}
+  \item \textbf{Termination probability} $p^{\text{end}}$: the user simulator's per-turn probability of ending the conversation (Section~\ref{sec:method}). 
+  This is a direct measure of the \emph{behavioral-withdrawal} pole and is free to read off during training.
+  \item \textbf{A trained engagement classifier}: a lightweight predictor trained on human interestingness labels (Section~\ref{sec:motivation-intrex}), which transfers the emotional dimension to unseen dialogue but is single-task and domain-bound.
+  \item \textbf{An LLM judge} scoring each student turn on the three literature dimensions, behavioral, affective, cognitive, on anchored $0$--$4$ rubrics grounded in the disaffection taxonomy \cit{skinner2009motivational}, learning-centered affect \cit{dmello2012affect}, and ICAP/uptake \cit{chi2014icap, cdemszky2021uptake} respectively 
+  (full rubric and prompt in Appendix~\ref{app:judge}). Crucially, the judge needs only the \emph{transcript text}, so it applies uniformly to real-student corpora and to simulators that never emit an end-of-conversation token, both settings where $p^{\text{end}}$ is unavailable. 
+  This is what enables the real-vs.-simulated comparison in Section~\ref{sec:motivation-judge}.
+\end{enumerate}
+The three signals are mutually validating: $p^{\text{end}}$ correlates with human interestingness labels (Section~\ref{sec:motivation-intrex}), and the
+judge's behavioral score measures the same withdrawal construct that $p^{\text{end}}$ quantifies probabilistically.
+
+% =====================================================================
+\section{Motivation}
+\label{sec:motivation}
+
+We need to show a few things:
+\begin{itemize}
+    \item Current models and datasets assume infinite student engagement/patience (qualitative evidence from literature) -> we condition learning on limited engagement/patience
+    \item Real student conversations behave differently from synthetic datasets -> we finetune our own student model to be more realistic \cit{https://aclanthology.org/2025.bea-1.8.pdf} (not important to show limitation of synthetic dataset? because we are not making our own datasets) LLM-as-a-judge eval different datasets with real/fake student/teacher to show that uptake is lower in real students. (scatter with four grids)
+    \item Current tutoring model underperform on less engaged students (Section \ref{sec:motivation-probe}, \ref{sec:motivation-tutorrl})
+    \item Our student model behaves more student-like in terms of engagement. How can engagement be quantified?
+    \item Our engagement metric is reliable (Section \ref{sec:motivation-intrex})
+\end{itemize}
+
+\subsection{Probing user engagement with a strong assistant}
+\label{sec:motivation-probe}
+
+To establish that disengagement is governed by the user model's behavior, we first ran controlled probes pairing a strong assistant/tutor (Claude) with the user simulator UserLM-8b \cit{userlm}, measuring $P(\langle\textsc{end}\rangle)$ after each assistant move (full logs in the appendix). 
+The qualitative pattern is consistent and strong: \emph{how} the assistant responds, not just \emph{what} it knows, controls whether the user stays.
+\begin{itemize}
+  \item Delivering a full, correct or incorrect answer makes the user leave immediately
+        (satisfied departure; $P(\langle\textsc{end}\rangle)\!\approx\!0.5$).
+  \item Refusing and offering only a Socratic hint also makes the user
+        leave (frustrated departure; $P(\langle\textsc{end}\rangle)\!\approx\!0.3$).
+  \item Asking a single, small, concrete question that requires little effort
+        keeps the user engaged ($P(\langle\textsc{end}\rangle)\!\approx\!0.002$).
+\end{itemize}
+This is the core issue our method targets: the pedagogically ``correct'' move (withhold and scaffold) is likely incurs disengagement, while engagement is maximized by low-effort, incremental requests. 
+This lines up with educational studies that shows the best way to learn is to solve incremental small problems that build up to a harder problem. \cit{}
+A tutor that is unaware of engagement will either give away the answer or drive the student away.
+
+\subsection{A pedagogically-aligned tutor fails under a disengaging student}
+\label{sec:motivation-tutorrl}
+
+We next quantify the effect on a released, RL-trained tutor, \texttt{TutorRL-7B} \cit{tutorrl}. 
+We evaluate it in its own multi-turn math-tutoring pipeline but replace the always-engaged student with UserLM-8b, which may end the dialogue. 
+To keep the learning metric comparable, we \emph{decouple} the student into an engagement simulator (UserLM, which produces the in-dialogue student turns and may leave) and a fixed knowledge probe (Llama-3.1-8B, which produces the pre- and post-dialogue solution attempts scored against ground truth, as used in TutorRL). 
+The experimental design, protocol, and implementation are detailed in Appendix~\ref{app:baseline}.
+
+Table~\ref{tab:baseline} reports the headline comparison on $500$ held-out
+problems. The only changed variable between conditions is the in-dialogue student
+model; pre-dialogue solve rates are identical ($0.276$), confirming a matched
+setup.
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{lcc}
+\toprule
+Metric & TutorRL $\times$ Llama & TutorRL $\times$ UserLM \\
+       & (always engaged) & (can disengage) \\
+\midrule
+Pre-dialogue solve rate   & 0.276  & 0.276 \\
+Post-dialogue solve rate  & 0.491  & 0.404 \\
+$\Delta$ Solve Rate       & \textbf{+0.215} & \textbf{+0.128} \\
+Leaked-solution rate      & 0.082  & \textbf{0.532} \\
+Disengagement rate        & 0 (by design) & 0.224 \\
+\bottomrule
+\end{tabular}
+\caption{TutorRL-7B under an always-engaged student (Llama-3.1-8B) vs.\ a
+disengagement-capable student (UserLM-8b), $N{=}500$, judge gemma-3-27b.
+Learning gain drops $\sim$40\% and solution-leakage rises $\sim$6.5$\times$.}
+\label{tab:baseline}
+\end{table}
+
+Three findings emerge. \textbf{(1) Learning gain drops $\sim$40\%}
+($\Delta$ Solve Rate $+0.215\!\rightarrow\!+0.128$). \textbf{(2) The loss is
+caused by disengagement}: splitting the UserLM condition by outcome, the $22\%$
+of students who disengage learn almost nothing ($\Delta\!=\!+0.04$; they leave at
+$\sim$turn~4.5, before scaffolding pays off), whereas the $78\%$ who stay learn
+$+0.15$. \textbf{(3) TutorRL abandons its core ``withhold'' objective under
+pressure}: solution leakage rises from $0.082$ to $0.532$. In short, against a
+realistic student TutorRL is caught between \emph{leaking the answer} ($53\%$) and
+\emph{losing the student} ($22\%$), and delivers less learning either way. This
+motivates training tutors that explicitly condition on engagement.
+
+\subsection{The disengagement signal $p^{\text{end}}$ tracks human engagement judgments}
+\label{sec:motivation-intrex}
+
+%(Per Mrinmaya's suggestion that our engagement measure ment is reliable and sensible)
+Our method treats UserLM's per-turn disengagement probability
+$p^{\text{end}}_t = P_U(\langle\textsc{end}\rangle \mid \cdot)$ as an engagement
+signal, so we briefly verify it tracks \emph{human} engagement rather than an
+artifact of one model's special token. We validate it against \textbf{IntrEx}
+\cit{intrex}, a dataset of human \emph{interestingness} ratings on real
+teacher--student tutoring dialogue (TSCC v2 \cit{tscc}): for each dialogue point
+we read $p^{\text{end}}$ at the student's next turn and correlate it with the
+human label (details in Appendix~\ref{app:intrex}). 
+
+The signal is \emph{negatively} associated with human-judged engagement. 
+Turns humans rate as less interesting are exactly those where UserLM is more likely to leave. 
+Mean $p^{\text{end}}$ rises ${\sim}30\times$ from the most- to the least-interesting
+turns (Spearman $\rho=-0.14$, $p<10^{-27}$), and the negative effect holds within
+$80\%$ of conversations and survives controls for context length and turn
+position. The effect is modest \emph{by construction}, interestingness measures
+engagement \emph{intensity} while $p^{\text{end}}$ measures probability of
+\emph{leaving}, and noisy human labels upper-bound any attainable correlation.
+However, its consistency across a cross-domain
+test indicates $p^{\text{end}}$ is a reasonable proxy for lack of interestingness.
+
+\subsection{LLM-as-student has higher engagement than real students}
+\label{sec:motivation-judge}
+
+If assistant-LLMs-as-students were adequate stand-ins for real learners, dialogues with simulated students should exhibit the same engagement profile as dialogues with real ones. 
+We test this directly by scoring engagement from seven (\todo{Teacher-student chatroom corpus was emailed to me, needs to be added}) educational-dialogue corpora with real and simulated teachers and students. We use LLM-judge defined in Section~\ref{sec:defining-engagement}. 
+The judge (\texttt{gpt-oss-20b}) scores each student turn given its dialogue context on behavioral, affective, and cognitive engagement ($0$--$4$ anchored rubrics); it sees
+only transcript text and is blind to each dialogue's provenance. 
+In total we score $5{,}955$ student turns from $1{,}145$ dialogues (protocol, prompt, and per-dataset details in Appendix~\ref{app:judge}).
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{llcccc}
+\toprule
+Student & Tutor & Behavioral & Affective & Cognitive & $n$ (dialogues) \\
+\midrule
+real & real & 2.00 & 2.07 & 1.33 & 559 \\
+real & LLM  & 2.44 & 2.38 & 1.84 & 341 \\
+LLM  & real & 2.85 & 2.75 & 2.33 & 185 \\
+LLM  & LLM  & 3.06 & 3.06 & 2.75 & 60 \\
+\bottomrule
+\end{tabular}
+\caption{Mean dialogue-level engagement scores ($0$--$4$) by grid cell,
+judge \texttt{gpt-oss-20b}. Engagement rises monotonically with each
+simulated ingredient and is highest when both sides are LLMs.}
+\label{tab:judge-grid}
+\end{table}
+
+Three findings emerge (Table~\ref{tab:judge-grid}). \textbf{(1) LLM students are systematically over-engaged.}  \textbf{(2) Engagement is inflated
+monotonically by every simulated component.} Replacing the real tutor with an LLM raises apparent student engagement, and replacing the student raises it further; fully synthetic dialogues (LLM$\times$LLM) has the highest engagement. 
+%\textbf{(3) The gap is not a verbosity artifact.} The difference survives controlling for turn length and turn position. and the real-student corpus with the \emph{longest} turns (StudyChat, median student turn ${>}100$ characters of pasted code) still scores well below every LLM-student corpus on cognitive engagement.
+
+As a sanity check on the judge itself, its affective score correlates positively with human interestingness annotations on the TSCC/IntrEx subset (Spearman $\rho=0.13$, $p<0.01$), consistent in direction and magnitude with the $p^{\text{end}}$ validation of Section~\ref{sec:motivation-intrex}. 
+We also note the comparison is conservative: the real-student corpora are biased \emph{toward} engagement (EEDI retains only completed dialogues; CoMTA was filtered to showcase effective tutoring), yet real students still score far lower (Appendix~\ref{app:judge-results}).
+
+
+
+\subsection{UserLM and our fine-tuned student model is closer to actual student behavior}
+\label{sec:similarity}
+
+
+% =====================================================================
+\section{Background}
+\label{sec:background}
+
+\paragraph{RL for pedagogical alignment (TutorRL / PedagogicalRL).}
+\cit{tutorrl} align a 7B model into a math tutor with online RL over simulated
+student--tutor dialogues, rewarding pedagogical quality and post-dialogue student
+solve rate while penalizing answer leakage, and tracing a Pareto frontier between
+support and solving via a controllable reward weight. \emph{Limitations:} the
+student simulator (Llama-3.1-8B) always engages and only the tutor can end a
+dialogue, so the objective ignores whether a real user would stay; and reward is
+assigned at the dialogue level (terminal solve rate), giving no within-dialogue
+credit assignment across tutor turns. (Lack of fine-grained credit assignment is a general issue in GRPO algos too.)
+
+\paragraph{User simulation (UserLM / WildChat).}
+UserLM \cit{userlm} is trained to imitate the \emph{user} side of conversations
+from WildChat \cit{wildchat}, including short turns, impatience, and an explicit
+end-of-conversation token. This makes it a realistic engagement model and exposes
+a per-turn disengagement probability. \emph{Limitations:} it models user
+\emph{behavior}, not a learner's \emph{knowledge state}, and it is
+out-of-distribution on long, structured math tutoring, motivating our training of a student user model.
+
+\paragraph{Simulated-student tutoring and learning-gain evaluation.}
+\todo{brief summary of related simulated-student tutoring / learning-outcome
+evaluation work} \cit{relatedstudentsim}. \emph{Limitation:} prior learning-gain
+metrics assume a fixed-length or tutor-terminated dialogue.
+
+\section{Defining Engagement}
+
+\section{Method: Training a StudentLM}
+\label{sec:studentlm}
+
+Section~\ref{sec:results} finds that UserLM's brevity limits how often the
+learning judge can detect solution progress at all, motivating a student
+simulator fine-tuned to be more naturalistic in a tutoring setting rather than
+a generic chat setting (Section~\ref{sec:future}). This section is not yet
+implemented; open questions are the relevant training datasets and how to
+select/control the simulated student's skill level and subject
+\todo{specify SFT data, procedure, and skill-level control for the student
+model}.
+
+% =====================================================================
+\section{Method: Engagement-Conditioned GRPO}
+\label{sec:method}
+
+For each objective we consider two reward variants of increasing cost and
+coverage. \textbf{Engagement:} (E1) the per-turn disengagement probability
+$p^{\text{end}}_t$ read directly from the student simulator
+(Section~\ref{sec:defining-engagement}), used in Eq.~\ref{eq:per-turn-reward}
+above; or (E2) a per-turn LLM-judge score on the three engagement dimensions
+(Section~\ref{sec:defining-engagement}, Appendix~\ref{app:judge}).
+\textbf{Learning outcome:} (L1) the terminal solve-rate reward used by prior
+work (Section~\ref{sec:motivation-tutorrl}); or (L2) an LLM-judge score of the
+terminal learning outcome (solution progress, understanding, independence),
+which also flags answer leakage. The per-turn objective above
+(Eq.~\ref{eq:objective}--\ref{eq:per-turn-reward}) targets (E1, L1) and remains
+future work (Section~\ref{sec:future}). \textbf{The ablation reported in
+Section~\ref{sec:results} implements and trains the (L2, E2) judge-based
+variant}, described next, as a first working system.
+
+\paragraph{Implemented reward (this work).} For a rollout $i$ we score the
+transcript with an LLM judge (Qwen2.5-14B-Instruct) and combine the two
+signals as a weighted sum,
+\begin{equation}
+  r_i \;=\; w_{\text{learn}} \cdot L_i \;+\; w_{\text{eng}} \cdot E_i,
+  \label{eq:weighted-reward}
+\end{equation}
+where $E_i \in [0,1]$ is the mean per-turn engagement score and $L_i \in
+[0,1]$ is the terminal learning score, zeroed out by a leak penalty $\mu$ when
+the judge flags the tutor as having leaked the solution (exact definitions in
+Appendix~\ref{app:grpo-ablation}). We optimize $r_i$ with GRPO, subtracting
+the group mean without dividing by the group standard deviation
+(Dr.\,GRPO~\cit{drgrpo}), which we found necessary for stability with a small
+KL anchor ($\beta=0.001$) after an earlier $\beta=0$ run collapsed. Full
+hyperparameters, model choices, and infrastructure are in
+Appendix~\ref{app:grpo-ablation}.
+
+\paragraph{Planned evaluation.} Beyond the reward-ablation results in
+Section~\ref{sec:results}, we plan a fuller evaluation once a higher-fidelity
+student simulator is available (Section~\ref{sec:future}): $\Delta$ solve rate
+under UserLM; engagement outcomes (disengagement rate, turns-to-disengagement,
+mean $p^{\text{end}}$ trajectory); leakage and pedagogy-adherence integrity
+checks; held-out judge scores from a judge not used in training (to detect
+reward-specific hacking); a transfer eval on related, unseen problems (immune
+to leakage by construction); cross-simulator evaluation against OdysSim; and a
+Pareto frontier of $\Delta$solve vs.\ disengagement rate across
+$w_{\text{eng}}$. Full protocol in Appendix~\ref{app:grpo-ablation}.
+
+\paragraph{Setup.} We model tutoring as a multi-turn interaction between a tutor policy $\pi_\theta$ and a simulated student on a problem $P$ with ground-truth answer $s$. 
+The student is decoupled into two components: an \emph{engagement simulator} $U$ (UserLM) that generates the student's conversational turns and, at each student turn $t$, may emit an end-of-conversation token with probability $p^{\text{end}}_t = P_U( \langle \textsc{end} \rangle \mid u_{<t})$. 
+And a fixed \emph{knowledge probe} $Q$ (an instruct model) that, conditioned on a transcript, samples $K$ final
+solutions to estimate a solve rate $\mathrm{solve}(\cdot) = \frac{1}{K}\sum_k
+\mathbf{1}[b^{(k)} = s]$. 
+(Optionally we would use the same model, that's more realistic, but harder to elicit a complete answer given the student's lazy nature)
+
+\paragraph{Objective.} Whereas prior work maximizes the post-dialogue solve rate
+assuming the student remains for the whole dialogue, we maximize the expected
+learning gain \emph{realized before the student disengages}:
+\begin{equation}
+  J(\theta) \;=\; \mathbb{E}_{\tau \sim \pi_\theta,\, U}\Big[\,
+      \underbrace{\big(\mathrm{solve}(s_T) - \mathrm{solve}(s_0)\big)}_{\text{learning gain}}
+      \cdot \underbrace{\textstyle\prod_{t=1}^{T}\big(1 - p^{\text{end}}_t\big)}_{\text{survival to } T}
+   \,\Big],
+   \label{eq:objective}
+\end{equation}
+where $s_0$ is the pre-dialogue state and $s_T$ the state at termination. The
+survival factor encodes that learning only counts if the student stays. 
+
+A potential implication for reward hacking is that $p^{\text{end}}_t$ is unnecessarily small but per-step learning is small. All learning are achieved in the last step. There could always be some unexpected reward hacking lol.
+
+\paragraph{Per-turn engagement reward and credit assignment.} Because
+$p^{\text{end}}_t$ is observable at every student turn, we convert engagement into
+a dense per-turn reward rather than a single terminal signal, directly addressing
+the lack of within-dialogue credit assignment in prior work, and lack of fine-grained credit assignment in general for RL. 
+For a tutor turn
+$a_t$ we use a shaped reward
+\begin{equation}
+  r_t \;=\; -\,\lambda\, p^{\text{end}}_{t} \;+\; \mathbf{1}[t = T]\, r_{\text{sol}},
+  \qquad r_{\text{sol}} = \mathrm{solve}(s_T),
+  \label{eq:per-turn-reward}
+\end{equation}
+where $\lambda$ controls the engagement--pedagogy trade-off (analogous to the
+leakage penalty weight in prior work, but acting per turn). Tutor turns that
+provoke disengagement are penalized at the turn that caused them.
+
+We could also do per-turn learning reward by SFT the judge model first. We get per-step learning outcome from a dataset (which one?) and use a LLM to label some sampled dialogue turns first. Then SFT a judge model to output per turn learning gains as a float. Again, this can be read directly after one forward pass without generating tokens. So this is very cheap, similar to engagement reward. Could be ablation but likely won't work well.
+
+\paragraph{Optimization.} We optimize $\pi_\theta$ with GRPO over groups of
+sampled dialogues, normalizing rewards within each group. We hypothesize that
+GRPO will discover a strategy of \emph{low per-step effort requests}, small,
+concrete, incremental questions that keep $p^{\text{end}}_t$ low while still
+advancing the student's understanding, consistent with the engagement probes in
+Section~\ref{sec:motivation-probe}.
+
+\paragraph{Student modeling.} The fidelity of the engagement simulator matters.
+We plan to (i) use UserLM directly as the base engagement model, and (ii)
+fine-tune student models to better match realistic learner behavior in the
+tutoring domain \todo{specify SFT data/procedure for student models}. We will
+train the tutor against both the base and the fine-tuned student.
+
+\paragraph{OdysSIM.} This is a newer released user model, trained more comprehensively. Initial experiments with OSIM shows that it does not terminate itself. It will always say something, even if brief. So if we want to use it, we need to measure engagement in a different way. 
+
+\paragraph{Generalization via related concepts.} To test whether tutoring
+produces transferable understanding rather than problem-specific patching, we
+plan a transfer evaluation over related concepts \todo{cite the concept-graph
+paper}: we condition the student on the prior tutoring turns and present a new,
+related problem, measuring whether the solve rate improves. This likely requires
+a student variant willing to produce a full solution in a single turn, which may
+differ from the engagement simulator (a known limitation).
+
+\paragraph{Pipeline.} Our overall plan is: (1)~establish that TutorRL fails under
+UserLM (Section~\ref{sec:motivation-tutorrl}, Appendix~\ref{app:baseline});
+(2)~fine-tune student/engagement models; (3)~train the tutor with
+engagement-conditioned GRPO, for both the base model and the fine-tuned student;
+and (4)~evaluate learning, engagement, and transfer.
+
+% =====================================================================
+\section{Results}
+\label{sec:results}
+
+As an initial check that the weighted-sum reward (Eq.~\ref{eq:weighted-reward})
+trains stably and behaves as intended, we ran a small ablation training
+Qwen2.5-7B-Instruct as the tutor against UserLM-8b with GRPO for up to $200$
+steps, sweeping the engagement weight $w_{\text{eng}} \in \{0.01, 0.05, 0.1,
+0.5\}$ (at $w_{\text{learn}}=1$, no leak penalty) and, separately, the leak
+penalty $\mu \in \{0, 1\}$ at $w_{\text{eng}}=0.01$ (full per-run numbers and
+setup in Appendix~\ref{app:grpo-ablation}).
+
+\textbf{Training is stable and both reward channels improve.} Across every
+run, judge-scored engagement reward rises from $\sim$0.30 to $\sim$0.37--0.41
+over training, and judge-scored learning reward roughly doubles ($\sim$0.03 to
+$\sim$0.05--0.07), regardless of $w_{\text{eng}}$.
+\textbf{Neither $w_{\text{eng}}$ nor $\mu$ visibly separates the learning-reward
+trajectory}: full-run linear slopes fall in a tight band
+($+0.14$ to $+0.25 \!\times\! 10^{-3}$ per batch) across the entire weight
+and leak-penalty range tested. The leak penalty has the expected \emph{sign}
+but a small magnitude: leak rate trends down under $\mu{=}0$ (e.g.\
+$-0.018$pp/batch at $w_{\text{eng}}{=}0.1$) and up with no penalty at all
+($\mu{=}1$: $+0.011$pp/batch), but both are small relative to per-batch
+sampling noise ($n{=}48$ dialogues/batch).
+
+\textbf{Root cause: reward sparsity, not reward weighting.} Reading the raw,
+pre-weighting judge scores directly, only $\sim$20\% of conversations receive
+\emph{any} nonzero score on the learning dimensions at all, and this rate is
+similar for leaked and non-leaked conversations alike (e.g.\ $20$--$25$\% vs.\
+$18$--$26$\%, depending on the run; Appendix~\ref{app:grpo-ablation}). The
+rising aggregate learning reward is driven by this nonzero rate increasing
+over training (from $\sim$6\% early in one representative run to
+$\sim$25--35\% mid/late-run), not by how the leak penalty or engagement weight
+is set: with $\sim$80\% of conversations pinned at exactly zero regardless of
+condition, there is little room left for either knob to differentiate
+outcomes. We attribute this primarily to \textbf{UserLM's brevity}: as a
+simulator trained to imitate terse, low-effort real chat users rather than
+students working through a problem \cit{userlm}, its turns rarely contain
+enough worked reasoning for the learning judge to detect solution progress,
+understanding, or independence, largely independent of the tutor's strategy.
+This echoes Section~\ref{sec:motivation-judge}'s finding that LLM-student
+dialogues are structurally different from real student--tutor exchanges, here
+on the learning side rather than the engagement side.
+
+We read this as a working proof of concept: a weighted engagement/learning
+reward trains without collapse and both channels improve over 200 steps of
+GRPO. We do not read it as evidence that engagement weighting or the leak
+penalty are ineffective; rather, the current student simulator supplies too
+little learning-relevant signal for either to be tested cleanly. Section~\ref{sec:future} discusses two ways to give the learning judge more signal to work with.
+
+% =====================================================================
+\section{Future Work}
+\label{sec:future}
+
+\paragraph{A more naturalistic student simulator.} The reward-sparsity finding
+of Section~\ref{sec:results} suggests the current bottleneck is the student
+simulator's brevity rather than the reward formulation. Two directions:
+(i)~fine-tune UserLM (or a similar base model) on real tutoring transcripts so
+it produces more substantive, worked-through student turns while retaining
+its capacity to disengage (Section~\ref{sec:studentlm}); (ii)~evaluate or
+switch to OdysSim, a more recently released user simulator; initial probes
+show it never self-terminates a conversation, so engagement would need to be
+measured via the LLM-judge dimensions rather than $p^{\text{end}}$
+(Section~\ref{sec:method}).
+
+\paragraph{Per-turn engagement shaping (E1) and solve-rate reward (L1).} The
+results in Section~\ref{sec:results} implement the terminal, judge-based (L2,
+E2) reward (Eq.~\ref{eq:weighted-reward}); the per-turn $p^{\text{end}}$-shaped
+objective of Eq.~\ref{eq:objective}--\ref{eq:per-turn-reward} remains to be
+trained and compared.
+
+\paragraph{Full evaluation suite.} The transfer eval, cross-simulator eval, and
+Pareto frontier over $w_{\text{eng}}$ outlined in
+Section~\ref{sec:method}/Appendix~\ref{app:grpo-ablation} remain to be run,
+ideally once the student-simulator work above supplies a cleaner learning
+signal.
+
+% =====================================================================
+\section*{References}
+\todo{add bibliography}
+
+% =====================================================================
+\appendix
+
+\section{Baseline: TutorRL under a Disengaging Student --- Methods and Setup}
+\label{app:baseline}
+
+This appendix details the experiment summarized in
+Section~\ref{sec:motivation-tutorrl}.
+
+\subsection{Thesis and decoupled roles}
+The TutorRL evaluation hard-codes an always-engaged student and a learning
+metric, $\Delta$ Solve Rate $=$ post-dialogue $-$ pre-dialogue solve rate, that
+assumes the student remains for the entire dialogue. We test robustness to
+disengagement while keeping the learning metric comparable by decoupling the
+student:
+\begin{itemize}
+  \item \textbf{Engagement simulator} = UserLM-8b: produces the in-dialogue
+    student turns and may leave. This is the only component swapped relative to
+    the original evaluation.
+  \item \textbf{Knowledge probe} = Llama-3.1-8B-Instruct (bf16), unchanged from
+    the original student: computes the pre-dialogue initial attempt and the
+    post-dialogue final solution (boxed answer verified against ground truth over
+    $K$ samples). This is exactly TutorRL's solve-rate reward, so $\Delta$ Solve
+    Rate is directly comparable to the original.
+  \item \textbf{Tutor} = TutorRL-7B (unchanged); \textbf{Judge} = gemma-3-27b-it
+    (leakage and pedagogy).
+\end{itemize}
+
+\subsection{Conversation protocol (in-distribution for both models)}
+Each model receives a first-turn context matching its own training distribution,
+with identical underlying information.
+\begin{itemize}
+  \item \textbf{Canonical conversation is tutor-initiated (GUIDED).} TutorRL was
+    trained to initiate and breaks (empty, echoed, or role-reversed turns) when
+    fed a cold ``solve this for me'' user message, which is out-of-distribution
+    for it. The tutor therefore generates the first turn from its own system
+    prompt (which contains the problem) and never sees the student's literal
+    opening.
+  \item \textbf{UserLM's view is student-first.} Its message list is
+    \texttt{[system: generic intent, user: synthetic ``here's the problem ...''
+    opening, assistant: tutor turn, user: student turn, \ldots]}. The intent is
+    generic (``You are a student trying to solve a math problem.''), and the
+    problem is delivered in the synthetic opening turn rather than the intent,
+    because placing the full problem in the intent is out-of-distribution for
+    UserLM.
+\end{itemize}
+Both models thus know the problem and neither is out-of-distribution; the
+knowledge probe is unchanged. We disclose one unavoidable asymmetry: the
+always-engaged baseline uses TutorRL's native persona-student, while the UserLM
+condition uses UserLM in its native user-simulator mode (UserLM must run as a
+user simulator to disengage at all). The tutor and the knowledge probe are
+identical across conditions.
+
+\subsection{Disengagement definition}
+A dialogue terminates (student leaves) when, on any student turn, UserLM either
+emits \texttt{<|endconversation|>} (explicit) or produces an empty/blank turn
+(silence: the model ends its turn with no content, which we treat as
+checking out). On disengagement we stop and score the transcript-so-far
+(partial-credit probe). We log the disengagement reason (explicit vs.\ silence).
+
+\subsection{Metrics}
+Pre-/post-dialogue solve rate and $\Delta$ Solve Rate (learning, via
+\texttt{math-verify} against ground truth, $K$ samples); leaked-solution rate and
+pedagogy-adherence (LLM judge); disengagement rate (with explicit/silence
+breakdown); average dialogue length; average turns-to-disengagement; and $\Delta$
+Solve Rate split by engaged vs.\ disengaged subpopulation. Dataset:
+\texttt{Big-Math-RL-Verified-Filtered} \cit{bigmath}, test split.
+
+\subsection{Configuration}
+$N{=}500$ problems, one dialogue per problem, $K{=}8$ student attempts for solve
+rate, max $15$ dialogue turns, tutor-initiated (GUIDED) protocol. Tutor
+TutorRL-7B; in-dialogue student Llama-3.1-8B (baseline) or UserLM-8b (ours);
+knowledge probe Llama-3.1-8B; judge gemma-3-27b-it. UserLM sampling follows its
+model card (temperature $1.0$, top-$p$ $0.8$), stopping at \texttt{<|eot\_id|>}
+and \texttt{<|endconversation|>}.
+
+\subsection{Detailed results}
+Full results, including the engagement split, are in
+Table~\ref{tab:baseline-full}.
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{lcc}
+\toprule
+& TutorRL $\times$ Llama & TutorRL $\times$ UserLM \\
+\midrule
+Pre-dialogue solve rate     & 0.276  & 0.276 \\
+Post-dialogue solve rate    & 0.4905 & 0.4042 \\
+$\Delta$ Solve Rate         & +0.2145 & +0.1282 \\
+Leaked-solution rate        & 0.082  & 0.532 \\
+Pedagogy-violation rate     & 0.062  & --- \\
+Disengagement rate          & 0      & 0.224 \\
+\quad via \texttt{<endconversation>} & --- & 61/500 \\
+\quad via silence (blank)            & --- & 51/500 \\
+Avg.\ dialogue length (msgs) & $\to$15 & 12.06 \\
+Avg.\ turns-to-disengagement & ---     & 4.52 \\
+\midrule
+\multicolumn{3}{l}{\emph{$\Delta$ Solve Rate split (UserLM condition):}}\\
+\quad Engaged ($n{=}388$, 78\%)    & \multicolumn{2}{c}{$+0.1527$ (pre 0.287 $\to$ post 0.439)} \\
+\quad Disengaged ($n{=}112$, 22\%) & \multicolumn{2}{c}{$+0.0435$ (pre 0.239 $\to$ post 0.282)} \\
+\bottomrule
+\end{tabular}
+\caption{Full baseline results ($N{=}500$, $K{=}8$, gemma-3-27b judge). The
+$22\%$ of students who disengage learn almost nothing ($+0.04$); the $78\%$ who
+stay learn $+0.15$.}
+\label{tab:baseline-full}
+\end{table}
+
+\subsection{Implementation notes}
+We adapted the released PedagogicalRL codebase \cit{tutorrl}. The in-dialogue
+student turns are routed through UserLM via an \texttt{EngagementClassroom}
+subclass that builds UserLM's student-first view and implements the
+disengagement (explicit + silence) termination; the tutor, judge, and knowledge
+probe use the original pipeline. Experiments ran on NVIDIA Blackwell (sm\_120)
+GPUs with a modernized vLLM (0.23) backend (the released stack pins versions that
+predate this hardware), with bf16 models (FP8 kernels are unavailable on this
+toolchain), and with each model resident on its own GPU. 
+
+\section{LLM-Judge Engagement Scoring --- Protocol and Prompt}
+\label{app:judge}
+
+This appendix details the LLM-judge evaluation summarized in
+Sections~\ref{sec:defining-engagement} and~\ref{sec:motivation-judge}.
+
+\subsection{Datasets and the real/simulated grid}
+\label{app:judge-datasets}
+
+We score every publicly obtainable dataset from our survey of educational
+dialogue corpora, arranged in a $2{\times}2$ grid over \{real, LLM\} student
+$\times$ \{real, LLM\} tutor:
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{llllr}
+\toprule
+Dataset & Student & Tutor & Domain & Dialogues \\
+\midrule
+EEDI/QATD-2k \cit{eedi} & real (K-12) & real (human tutors) & maths & 200 \\
+Bridge \cit{bridge} & real & real (novice tutors) & maths & 188 \\
+TSCC/IntrEx \cit{tscc, intrex} & real (ESL learners) & real (teachers) & English & 171 \\
+CoMTA \cit{comta} & real & LLM (Khanmigo/GPT-4) & maths & 188 \\
+StudyChat \cit{studychat} & real (undergrads) & LLM (GPT-4o-mini) & coding & 153 \\
+MathDial \cit{mathdial} & LLM (GPT-3.5) & real (teachers) & maths & 185 \\
+PATS \cit{pats} & LLM (persona) & LLM & literacy & 60 \\
+\bottomrule
+\end{tabular}
+\caption{Datasets scored by the engagement judge; the count is dialogues with at least one scoreable student turn, after sampling up to 200 dialogues per dataset (seed 0). 
+TSCC/IntrEx units are annotated lesson segments.\todo{there are two that needs to email to get the dataset, only one got back to me}}
+\label{tab:judge-datasets}
+\end{table}
+
+Excluded from the table's candidates: MathTutorBench (a recombination of
+MathDial and Bridge, already covered), RECIPE4U (consent-gated, not
+downloadable), and CodeAid (contains no tutor turns, so uptake-dependent
+dimensions are undefined). CoMTA is used under Khan Academy's non-commercial
+evaluation license.
+
+\subsection{Unit of analysis and formatting}
+Every corpus is converted to a common schema. Consecutive same-speaker
+messages are merged into a single turn. The judge scores each
+\emph{student} turn that has at least one preceding tutor turn (uptake is
+undefined without tutor context), given the full prior dialogue (up to the
+last 10 merged turns; individual turns truncated at 1{,}200 characters). At
+most 12 target turns per dialogue are scored (evenly spaced when a dialogue
+has more). Dataset-specific parsing: MathDial conversations are split on
+\texttt{|EOM|} markers and teacher dialogue-act prefixes are stripped; PATS
+dialogues are recovered from the released survey-comparison files and
+deduplicated by dialogue id; StudyChat dialogues are reconstructed per
+\texttt{chatId} from the longest logged message history; TSCC/IntrEx
+segments are parsed from the sequence-level release, retaining the mean
+human interestingness label for validation.
+\todo{i think intrex is actually scored, but tscc might be longer. we should use tscc instead.}
+
+\subsection{Judge model and inference}
+The judge is \texttt{gpt-oss-20b} served with vLLM (temperature $1.0$,
+reasoning effort \emph{low}, max $1{,}500$ generated tokens), prompted with
+the system prompt below and the formatted dialogue, and required to return a
+JSON object with a rationale and a $0$--$4$ score per dimension.
+Non-parsable outputs are retried once. The judge is blind to the provenance
+of the dialogue: nothing in the prompt indicates whether the student or
+tutor is human or a model.
+
+\subsection{Full system prompt}
+\label{app:judge-prompt}
+
+{\small
+\begin{verbatim}
+You are an expert in the learning sciences annotating STUDENT engagement in
+a one-on-one tutoring dialogue. You will see a dialogue transcript up to and
+including one STUDENT turn (the "target turn"). Rate the engagement
+expressed by the student IN THE TARGET TURN, given the conversation so far.
+
+Engagement is a multidimensional construct. Score three dimensions
+independently. Judge ONLY the student. Ignore the tutor's quality. Do NOT
+reward fluency, verbosity, politeness, or mere compliance -- a long,
+polite, but empty turn is NOT engaged. Productive confusion ("wait, why
+does that work?") counts as ENGAGED, not disengaged; only checking-out
+counts as disengaged.
+
+=== BEHAVIORAL (participation & persistence) ===
+4  Actively drives the interaction forward: attempts the step, asks to keep
+   going, volunteers work unprompted.
+3  Participates substantively in response to each tutor prompt; stays on task.
+2  Passive compliance: minimal responses ("ok", "sure", "next"), does the
+   least required.
+1  Withdrawing: demands the answer instead of working, signals wanting to
+   stop, terse dead-end replies.
+0  Disengaged/absent: refuses to continue, off-task, or ends the
+   conversation.
+
+=== AFFECTIVE (interest vs. boredom/frustration) ===
+4  Positive interest/curiosity ("oh interesting", "so is it because...?").
+3  Willing, neutral-positive tone.
+2  Flat/neutral affect.
+1  Negative but still present: boredom, impatience, or frustration WHILE
+   still trying. (Frustration + effort belongs here, not 0.)
+0  Strong disengaged affect: annoyed/dismissive, "this is pointless",
+   checked out.
+
+=== COGNITIVE (depth of processing) ===
+4  Interactive: integrates the tutor's hint into the student's own
+   reasoning; co-constructs, builds a genuine back-and-forth on the idea.
+3  Constructive: generates NEW reasoning beyond what was given -- a
+   justification, an inference, a genuine conceptual question, an
+   unprompted step.
+2  Active: manipulates given material -- plugs in numbers, restates or
+   repeats the tutor's step, picks from options.
+1  Passive: only receives/acknowledges ("got it", "I see") with no
+   processing.
+0  None: ignores the tutor's content, or just re-demands the answer.
+
+For EACH dimension, give a one-clause rationale, then the score. If the
+target turn is empty or pure silence, all three scores are 0.
+
+Return ONLY this JSON object and nothing else:
+{"behavioral": {"rationale": "...", "score": N},
+ "affective": {"rationale": "...", "score": N},
+ "cognitive": {"rationale": "...", "score": N}}
+\end{verbatim}
+}
+
+The user message contains the topic (when available), the dialogue history
+labeled \texttt{Tutor:}/\texttt{Student:}, and the target student turn
+marked \texttt{[TARGET STUDENT TURN -- rate this]}.
+
+\subsection{Detailed results}
+\label{app:judge-results}
+
+All $5{,}955$ judge calls returned parsable scores ($100\%$, one retry
+pass). Table~\ref{tab:judge-perdataset} gives turn-level means per dataset.
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{lrrcccr}
+\toprule
+Dataset & Dialogues & Turns & Behavioral & Affective & Cognitive &
+Med.\ turn len \\
+\midrule
+\multicolumn{7}{l}{\emph{real student $\times$ real tutor}}\\
+Bridge      & 188 & 246   & 1.84 & 1.86 & 1.16 & 3 \\
+EEDI        & 200 & 1{,}998 & 2.08 & 2.09 & 1.39 & 8 \\
+TSCC/IntrEx & 171 & 425   & 2.08 & 2.24 & 1.39 & 30 \\
+\multicolumn{7}{l}{\emph{real student $\times$ LLM tutor}}\\
+CoMTA       & 188 & 876   & 2.42 & 2.31 & 1.76 & 14 \\
+StudyChat   & 153 & 827   & 2.55 & 2.54 & 1.99 & 121 \\
+\multicolumn{7}{l}{\emph{LLM student $\times$ real tutor}}\\
+MathDial    & 185 & 1{,}152 & 2.79 & 2.68 & 2.26 & 155 \\
+\multicolumn{7}{l}{\emph{LLM student $\times$ LLM tutor}}\\
+PATS        & 60  & 431   & 2.99 & 2.98 & 2.65 & 275 \\
+\bottomrule
+\end{tabular}
+\caption{Turn-level mean engagement scores per dataset (judge
+\texttt{gpt-oss-20b}), with median student-turn length in characters.
+Within each grid cell, datasets agree closely despite differing domains
+(maths, ESL, coding, literacy), and the cells are strictly ordered. \todo{why is bridge/eedi/comta so short}}
+\label{tab:judge-perdataset}
+\end{table}
+
+\paragraph{Consistency within cells.} The three real$\times$real corpora
+span three domains and two age ranges yet produce near-identical profiles
+(behavioral $1.84$--$2.08$, cognitive $1.16$--$1.39$), suggesting the judge
+measures a stable property of real-student discourse rather than a dataset
+quirk.
+
+\paragraph{Turn-length confound.} Real students type far shorter turns
+(median $16$ vs.\ $189$ characters), so we verify the effect is not
+length-driven: residualizing scores on $\log$ turn length and turn
+position, the partial Spearman correlation between the residual and
+student type (LLM${=}1$) remains positive on every dimension
+(behavioral $+0.13$, $p<10^{-22}$; affective $+0.06$, $p<10^{-4}$;
+cognitive $+0.12$, $p<10^{-18}$). \todo{check these data}
+StudyChat, whose real students paste long code excerpts (median $121$ chars), still scores below every
+LLM-student corpus on all dimensions.
+
+\paragraph{Judge validation on human labels.} On the TSCC/IntrEx segments
+($n{=}425$ scored turns with human labels), the judge's affective score
+correlates with mean human interestingness (Spearman $\rho=+0.13$,
+$p=0.006$); behavioral is directionally consistent ($\rho=+0.11$,
+$p=0.028$) and cognitive is not significant ($\rho=+0.06$), as expected \todo{check these data}
+since interestingness targets the emotional, not the depth, dimension.
+The magnitude matches the $p^{\text{end}}$--IntrEx correlation of
+Appendix~\ref{app:intrex}, with the same caveat that noisy $0$--$4$ human
+labels upper-bound attainable correlations.
+
+\paragraph{Known biases (all conservative).} EEDI retains only completed
+dialogues (biased against abandonment); CoMTA was curated to showcase
+effective Khanmigo tutoring; TSCC lessons are scheduled and run to a
+natural close. All three biases inflate \emph{real}-student engagement,
+so the true real-vs-simulated gap is likely larger than measured. MathDial
+student turns were generated by GPT-3.5 prompted to exhibit confusion,
+i.e.\ an LLM student \emph{designed} to struggle, and it still
+out-engages every real-student corpus on all three dimensions. PATS
+student turns include roleplay stage directions (e.g.\ ``(looks down,
+fidgeting)''), which the judge may read as affect signals; excluding PATS
+leaves the LLM-vs-real gap essentially unchanged (MathDial alone exceeds
+all real corpora).
+
+\section{Validating $p^{\text{end}}$ against human engagement labels (IntrEx)}
+\label{app:intrex}
+
+This appendix details the validation summarized in Section~\ref{sec:motivation-intrex}.
+
+\paragraph{Data.} IntrEx \cit{intrex} annotates the Teacher--Student Chatroom
+Corpus (TSCC V2 \cit{tscc})---real one-to-one online English-as-a-second-language
+lessons---with \emph{interestingness} (INT) and \emph{expected interestingness}
+scores on a $0$--$4$ scale, three annotators per item. We use its
+\emph{sequence-level} release ($5{,}801$ items over $259$ conversations), where a
+sequence is a coherent lesson segment.
+
+\paragraph{Computing $p^{\text{end}}$.} We reconstruct each conversation by
+concatenating its sequences in order and parsing student/teacher turns, merging
+consecutive same-speaker turns (required for a valid chat template; ${\sim}38\%$ of
+adjacencies are same-speaker in this data). Following UserLM's convention the
+student maps to the \texttt{user} role and the teacher to \texttt{assistant}. For
+each sequence we build the dialogue history up to its last teacher turn---so the
+next turn UserLM would generate is the student's---prepend a generic
+language-learning intent as the system message ("You are a student in an online English lesson with your teacher."), 
+and in a single forward pass read $p^{\text{end}}=P(\langle\textsc{end}
+\rangle)$ as the student's first generated token. Because the template may place
+the termination token after a leading newline, we take the maximum over the first
+two positions; we separately record the silence probability $P(\langle\textsc{eot}
+\rangle)$. This is identical to the per-turn signal used by the reward. Sequences
+without a preceding teacher turn are dropped, leaving $N{=}5{,}718$.
+
+%\paragraph{Analysis.} We correlate per-sequence $p^{\text{end}}$ with the mean human INT. To respect the nesting of sequences within conversations we report, beyond raw Spearman/Pearson coefficients, (i) a linear mixed-effects model $\textsc{int}\sim p^{\text{end}}+(1\mid\text{conversation})$, (ii) a bootstrap over conversations (resampled with replacement) for a cluster-robust correlation CI, and (iii) the distribution of within-conversation Spearman correlations with a sign test. Discriminant checks use partial Spearman correlations controlling for $\log$ context length and sequence index.
+
+\paragraph{Caveats.} TSCC lessons are scheduled and run to a natural close, so no
+student actually drops out; we therefore validate $p^{\text{end}}$ against the
+human engagement \emph{labels}, not against observed leaving. The domain (language
+tutoring) also differs from our math setting, making this a cross-domain test that strengthens the generalization claim.
+
+\section{Weighted-Sum Engagement-Conditioned GRPO --- Training Details and Full Ablation Results}
+\label{app:grpo-ablation}
+
+This appendix details the reward, training setup, and ablation summarized in
+Section~\ref{sec:method} (``Implemented reward'') and
+Section~\ref{sec:results}.
+
+\subsection{Reward definitions}
+\label{app:grpo-reward-defs}
+
+Both signals are computed by an LLM judge (Qwen2.5-14B-Instruct) from the full
+transcript.
+
+\paragraph{Engagement score $E_i$.} Mean over the student's turns (excluding
+turns the judge flags as assistant role-drift) of $(\text{behavioral} +
+\text{affective} + \text{cognitive})/12$, each dimension scored $0$--$4$ on the
+rubric of Appendix~\ref{app:judge-prompt}. Undefined (all-drifted or empty)
+dialogues score $0$.
+
+\paragraph{Learning score $L_i$.} Mean of solution-progress, understanding,
+and independence (each $0$--$4$), plus misconception-repair when applicable,
+divided by $4 \times(\text{number of dimensions used})$; multiplied by
+$\min(1, n_{\text{real}}/2)$ where $n_{\text{real}}$ is the number of
+non-empty student turns, to avoid crediting near-empty dialogues. If the same
+terminal judge flags the tutor as having leaked the solution, $L_i$ is
+multiplied by a leak penalty $\mu \in \{0, 1\}$ before the weighted sum;
+$\mu{=}0$ zeroes learning credit entirely on a leaked dialogue, $\mu{=}1$
+applies no penalty.
+
+\paragraph{Combination and optimization.} Total reward is
+$r_i = w_{\text{learn}} L_i + w_{\text{eng}} E_i$ (Eq.~\ref{eq:weighted-reward}), summed
+across the two reward functions inside GRPO. Advantages are group-mean
+subtracted (groups of $8$ rollouts per problem) without dividing by the group
+standard deviation (Dr.\,GRPO~\cit{drgrpo}), which we found necessary for
+stability: an earlier run with no KL anchor ($\beta{=}0$) and std-normalized
+advantages collapsed by step $\sim$95.
+
+\subsection{Training setup}
+\label{app:grpo-training-setup}
+
+Tutor (trainable policy): Qwen2.5-7B-Instruct. Student/engagement simulator
+(frozen): UserLM-8b, temperature $1.0$, top-$p$ $0.8$, per its model card.
+Judge (frozen): Qwen2.5-14B-Instruct, temperature $1.0$. GRPO group size $8$
+rollouts/problem, $6$ problems/batch ($48$ dialogues/step), learning rate
+$5\!\times\!10^{-7}$, KL coefficient $\beta=0.001$, up to $200$ optimizer
+steps, DeepSpeed ZeRO-2. Dialogue budget: max $15$ turns, $512$ tokens/turn,
+$4{,}500$ tokens/conversation. Training data: Big-Math-RL-Verified-Filtered
+\cit{bigmath}, full train split, shuffled (seed $42$).
+
+\subsection{Ablation: engagement weight and leak penalty}
+\label{app:grpo-ablation-table}
+
+Table~\ref{tab:grpo-ablation} reports full-trajectory linear-regression
+slopes (batch index vs.\ metric) over every logged batch of each run, plus
+early-run (first $20\%$ of batches) vs.\ late-run (last $20\%$) bucket
+averages. The $w_{\text{eng}}{=}0.5$ run terminated early (step $114/200$) on
+a judge-context-length overflow on an unusually long conversation, fixed for
+future runs by raising the judge's context window; it is included for
+completeness but is less trained than the others.
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{lccccc}
+\toprule
+Config & Batches & Leak rate & Learning reward & Engagement reward & Leak rate \\
+($w_{\text{eng}}$, $\mu$) & (of 200) & slope (\%/batch) & slope ($\times 10^{-3}$/batch) & slope ($\times 10^{-3}$/batch) & early$\to$late \\
+\midrule
+0.01, $\mu{=}0$ & 195 & $-0.008$ & $+0.141$ & $+0.305$ & $0.498\to0.484$ \\
+0.05, $\mu{=}0$ & 104 & $+0.037$ & $+0.196$ & $+0.783$ & $0.501\to0.518$ \\
+0.10, $\mu{=}0$ & 191 & $-0.018$ & $+0.221$ & $+0.494$ & $0.499\to0.445$ \\
+0.50, $\mu{=}0$ (crashed) & 114 & $+0.039$ & $+0.222$ & $+0.400$ & $0.507\to0.562$ \\
+0.01, $\mu{=}1$ (no penalty) & 180 & $+0.011$ & $+0.254$ & $+0.396$ & $0.528\to0.559$ \\
+\bottomrule
+\end{tabular}
+\caption{Full ablation over engagement weight $w_{\text{eng}}$ and leak
+penalty $\mu$ ($w_{\text{learn}}=1$ throughout). Learning- and
+engagement-reward slopes are similar across the entire range; leak rate
+trends down under both non-trivial-weight penalized runs that reached
+$>$190 batches and up under the unpenalized run, but all effects are small
+relative to per-batch sampling noise ($n{=}48$/batch).}
+\label{tab:grpo-ablation}
+\end{table}
+
+\subsection{Reward-sparsity analysis}
+\label{app:grpo-sparsity}
+
+To explain the flat response in Table~\ref{tab:grpo-ablation}, we recomputed
+the raw (pre-leak-gating, pre-weighting) learning score for every logged
+conversation in sampled batches from each run. Table~\ref{tab:sparsity-leak}
+reports the fraction of conversations with a nonzero raw learning score,
+split by leak status; Table~\ref{tab:sparsity-time} tracks this rate over
+training for one representative run.
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{lccc}
+\toprule
+Config & Overall nonzero rate & Leaked nonzero rate & Non-leaked nonzero rate \\
+\midrule
+$w_{\text{eng}}{=}0.10$, $\mu{=}0$ & 20.8\% & 20.0\% & 21.6\% \\
+$w_{\text{eng}}{=}0.50$, $\mu{=}0$ (crashed) & 19.4\% & 17.6\% & 21.4\% \\
+$w_{\text{eng}}{=}0.01$, $\mu{=}0$ & 22.2\% & 24.6\% & 20.5\% \\
+$w_{\text{eng}}{=}0.01$, $\mu{=}1$ (no penalty) & 19.4\% & 13.7\% & 25.4\% \\
+\bottomrule
+\end{tabular}
+\caption{Fraction of conversations scoring nonzero on any raw learning
+dimension (solution progress, understanding, independence, or misconception
+repair), sampled from three batches (early/mid/late) per run. Leaked and
+non-leaked conversations score nonzero at similar rates in three of four
+runs, indicating the leak gate is usually zeroing an already-zero value
+rather than a large positive one.}
+\label{tab:sparsity-leak}
+\end{table}
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{lccccc}
+\toprule
+Batch (of 195) & 1 & 49 & 98 & 147 & 195 \\
+\midrule
+Nonzero rate & 6.2\% & 22.9\% & 35.4\% & 29.2\% & 25.0\% \\
+\bottomrule
+\end{tabular}
+\caption{Fraction of conversations with nonzero raw learning score over the
+course of training, $w_{\text{eng}}{=}0.01$, $\mu{=}0$ run. The rising rate,
+not a change in how leaking or engagement weight is handled, is what drives
+the aggregate learning-reward increase reported in
+Table~\ref{tab:grpo-ablation}; even at its peak, $\sim$65--70\% of
+conversations still score exactly zero.}
+\label{tab:sparsity-time}
+\end{table}
+
+\subsection{Implementation notes}
+Every rollout batch (full transcripts, per-turn and terminal judge scores,
+including the leak flag) is persisted to disk for offline analysis; the
+tables above are computed directly from these dumps rather than from
+aggregated training logs, so they are exact rather than resampled. Runs were
+trained on 8-GPU nodes with the rollout server (teacher, student-simulator,
+and judge vLLM engines) and the DeepSpeed ZeRO-2 trainer time-sliced on the
+same node, since no stage in this pipeline overlaps with another.
+
+\end{document}

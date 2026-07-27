@@ -67,6 +67,9 @@ def main(cfg: TrainEngagementRLConfig):
     kwargs = [InitProcessGroupKwargs(timeout=timedelta(hours=10))]
     accelerator = Accelerator(kwargs_handlers=kwargs)
 
+    if accelerator.is_main_process:
+        logger.info("Resolved config:\n" + OmegaConf.to_yaml(cfg))
+
     if logging_config.wandb and accelerator.is_main_process:
         wandb.init(
             project=logging_config.wandb_project,
@@ -80,7 +83,7 @@ def main(cfg: TrainEngagementRLConfig):
 
     model_kwargs = dict(
         trust_remote_code=True,
-        attn_implementation="sdpa",  # flash-attn wheels predate sm_120
+        attn_implementation=train_config.attn_implementation,
         torch_dtype=torch.bfloat16,
         use_cache=False if train_config.gradient_checkpointing else True,
     )

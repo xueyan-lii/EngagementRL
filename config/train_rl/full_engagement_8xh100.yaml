@@ -1,0 +1,178 @@
+# Full engagement-conditioned GRPO run -- dedicated 8x H100 80GB node.
+# (Adapted from full_engagement.yaml, which was tuned for a shared node
+# where GPUs 0/5/6 belonged to other users.)
+#
+# GPU layout -- all 8 are ours, nothing to route around:
+#   0-3  DeepSpeed ZeRO-2 trainer (4 ranks, config/deepspeed/zero2_4GPU.yaml).
+#        Holds the policy (teacher_model), the frozen reference copy for KL,
+#        and fp32 Adam state. Going 3->4 ranks vs. the shared-node layout
+#        eases the memory pressure that forced batch_size_ref_model=1 (see
+#        below) and shortens the backward/optimizer-step phase.
+#   4-5  teacher rollout engine, tensor_parallel_size=2 (gpu_ids: [4, 5]).
+#        This is the most frequently invoked engine -- it runs on every one
+#        of the ~15 alternating turn-rounds per batch and reloads weights
+#        from disk each step -- so it benefits most from the extra GPU.
+#   6    engagement rollout engine (UserLM-8b, frozen "student" simulator).
+#        Dedicated GPU now instead of splitting GPU7 with the judge.
+#   7    judge engine (Qwen2.5-14B-Instruct, frozen). Dedicated GPU now
+#        instead of splitting GPU7 with the engagement model. NOT gpt-oss-20b
+#        (the original full_engagement.yaml's judge): gpt-oss has attention
+#        sinks, and vLLM hard-forces sink models onto the Triton attention
+#        backend on anything that isn't a Hopper (H100/cap-90) GPU -- see
+#        vllm/platforms/cuda.py's get_attn_backend_cls. On this cluster's
+#        A100s that means Triton JIT-compiling a C helper via gcc+libcuda
+#        EVERY time, and a chunk of this node pool has an incomplete/broken
+#        toolchain for that (missing `ld`, missing liblto_plugin.so, ...),
+#        inconsistently by node. Qwen2.5-14B-Instruct is a plain dense model
+#        (no sinks, no quantization kernels) so it uses the same
+#        already-proven FlashAttention path as teacher/engagement.
+#
+# Why this shape: rollout (teacher<->engagement turn alternation) and judge
+# scoring are two sequential phases inside one persistent server process
+# (train_server.py); the DeepSpeed trainer is a separate process that only
+# starts its backward pass after the server returns a full batch. None of
+# the three vLLM engines, nor the trainer, ever run concurrently with each
+# other. So "fully utilize the node" here means: shrink each phase's slice
+# of the sequential per-step wall clock by giving its engine(s) more
+# GPU/HBM, not overlap them (this pipeline has no async/off-policy rollout
+# to overlap with). Watch the "Took Xs" / "Judge scoring took Xs" server
+# logs after a few steps: if judge-scoring dominates over rollout, move a
+# GPU from the teacher to the judge (gpu_ids: teacher [4], judge [5, 6]).
+#
+# v1: beta=0.001 + scale_rewards=False after v0 policy collapse (no-KL +
+# std-normalized advantages amplified noise once rewards dipped).
+
+train:
+  number_of_problems_per_batch: 6   # x8 samples = 48 dialogues/step (divisible by 4 ranks)
+  num_samples_per_problem: 8        # GRPO group size (TutorRL value)
+  per_device_train_batch_size: 1    # full-vocab logits ~7GB per 6k-token seq
+
+  learning_rate: 5e-7
+  beta: 0.001   # KL anchor restored; beta=0 collapsed v0 at ~step 95
+  mu: 1
+  max_steps: 200
+  optimizer: adamw_torch
+  gradient_checkpointing: true
+  save_policy_to_disk_every_n: 1   # cheap + self-pruning (src/grpo/trainer.py
+                                    # _save_only_model deletes the previous
+                                    # policy/checkpoint-* every time) -- this
+                                    # is how the rollout server gets fresh
+                                    # weights every step; leave at 1
+  batch_size_ref_model: 1   # ref logprob chunk of 4 seqs = 14GB fp32 logits -> OOM
+                             # on the old 3-rank layout. Each rank now sees
+                             # 12 seqs/step instead of 16, so bumping this to
+                             # 2 is worth trying once the run is confirmed
+                             # stable at 1.
+  attn_implementation: sdpa  # flash_attention_2 needs the standalone
+                             # flash_attn pip package, which isn't installed
+                             # in vllm2 (this repo's venv, see
+                             # run_full_engagement_8xh100.sh) and would need
+                             # a slow from-source build to add. sdpa needs
+                             # nothing extra; revisit flash_attention_2 as a
+                             # throughput optimization once the pipeline is
+                             # confirmed working end-to-end.
+
+teacher_model:
+  model_name_or_path: Qwen/Qwen2.5-7B-Instruct
+  vllm:
+    temperature: 1.0
+    top_k: 50
+    top_p: 1.0
+    max_length: 8192
+    max_num_seqs: 64
+    gpu_memory_utilization: 0.8
+    gpu_ids: [4, 5]
+    load_and_unload: false
+    enable_sleep_mode: false
+    use_v0: false
+    enforce_eager: true
+
+engagement_model:
+  model_name_or_path: microsoft/UserLM-8b
+  vllm:
+    temperature: 1.0   # UserLM model card
+    top_p: 0.8
+    max_length: 8192   # UserLM's max_position_embeddings cap
+    max_num_seqs: 64
+    gpu_memory_utilization: 0.8   # dedicated GPU now (was 0.30 sharing GPU7)
+    gpu_ids: [6]
+    load_and_unload: false
+    enable_sleep_mode: false
+    use_v0: false
+    enforce_eager: true
+
+judge_model:
+  model_name_or_path: openai/gpt-oss-20b #Qwen/Qwen2.5-14B-Instruct
+  vllm:
+    temperature: 1.0   # validated in engagement_eval (100% parse w/ retry)
+    top_k: -1
+    top_p: 1.0
+    max_length: 8192
+    max_num_seqs: 64
+    gpu_memory_utilization: 0.85   # dedicated GPU now (was 0.50 sharing GPU7)
+    gpu_ids: [7]
+    load_and_unload: false
+    enable_sleep_mode: false
+    use_v0: false
+    # Skips torch.compile/CUDA graph capture entirely -- same reasoning as
+    # teacher/engagement above: this cluster's compute nodes can't reliably
+    # JIT-compile anything (see the judge-model comment above and
+    # run_full_engagement_8xh100.sh's .fake_cuda notes), so eager mode
+    # everywhere, at some throughput cost, is the robust default.
+    enforce_eager: true
+
+reward:
+  engagement_weight: 0.5
+  learning_weight: 1.0
+  leak_multiplier: 0.0   # judge flags tutor_leaked -> learning reward x this
+
+dataset:
+  max_train_examples: -1   # full Big-Math train split, shuffled (seed 42)
+
+generation:
+  max_turns: 15                  # TutorRL / baseline value; room for learning
+  max_tokens_per_turn: 512
+  max_tokens_in_conversation: 4500  # caps logit memory so the ref model fits
+  max_tokens_per_judge_attempt: 1500
+  number_judge_attempts: 0       # no leakage/pedagogy judges at train time
+  use_thinking: true
+  forced_conversation_type: guided
+  server_port: 8006
+  use_experimental_shared_memory: false
+
+logging:
+  wandb: true
+  wandb_project: engagement-rl
+  # ${oc.env:JOB_ID,local} resolves to condor's Cluster.Process (exported by
+  # full_engagement_8xh100.sub / run_full_engagement_8xh100.sh) so multiple
+  # concurrent runs are distinguishable in wandb; falls back to "local" when
+  # run outside condor (e.g. manually, with no JOB_ID set).
+  wandb_run_name: qwen7b-userlm-qwen14b-wE${reward.engagement_weight}-${oc.env:JOB_ID,local}
+  run_group: full
+  wandb_tags: ["full", "userlm", "qwen14b-judge", "8xh100"]
+  # Job-ID-scoped for the same reason as wandb_run_name above, but far more
+  # important here: this is a real filesystem race, not just cosmetic mixup.
+  # _save_only_model (src/grpo/trainer.py) prunes any OTHER checkpoint-N
+  # directory it finds under save_dir/policy/ on every save. Two concurrent
+  # runs sharing one save_dir will delete each other's in-progress
+  # checkpoints -- this is what caused both "worker died during startup"
+  # (loaded a checkpoint dir the other job had just rm'd) and
+  # SafetensorError: No such file or directory (the other job rm'd this
+  # job's checkpoint mid-write) on 2026-07-22 when multiple jobs were
+  # running with the unscoped path.
+  save_dir: checkpoints/full_engagement_8xh100-${oc.env:JOB_ID,local}
+  save_steps: 200   # Full checkpoints (model + fp32 Adam/scheduler state via
+                     # DeepSpeed, save_only_model=False) are ~114GB each; a
+                     # 40-step cadence over a 200-step run already filled
+                     # disk once (train_rl_engagement.py hardcodes
+                     # save_total_limit=2, so at most 2 = ~228GB are ever kept
+                     # on disk at once, but even that was too much at 40).
+                     # 100 -> only 2 full checkpoints for the whole 200-step
+                     # run. This is UNRELATED to train.save_policy_to_disk_every_n
+                     # above, which is a separate, self-pruning, weights-only
+                     # save (~14GB, always exactly one copy) used purely to
+                     # hand the rollout server fresh policy weights each step
+                     # -- don't raise that one. If you still see disk
+                     # pressure, drop save_total_limit 2->1 in
+                     # train_rl_engagement.py (halves peak usage, no
+                     # redundancy if the last write is interrupted).

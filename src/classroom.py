@@ -478,6 +478,47 @@ class Conversation:
     def add_initial_rewards(self, rewards: List[float]):
         self.initial_rewards = rewards
 
+    def get_transfer_test_prompt(self, problem_b: str):
+        """Same dialogue-so-far as GENERATE_SOLUTION, but asks the student to
+        solve a different (sibling) problem instead of re-solving self.problem --
+        used to test transfer of tutoring to an unseen problem."""
+        conversation = [
+            {"role": "system", "content": self.system_prompt_student}
+        ] + self._get_conversation_from_student_perspective()
+        transfer_prompt = read_template(
+            self.generation_cfg.transfer_test_prompt_path
+        ).render(problem=problem_b)
+        conversation.append({"role": "user", "content": transfer_prompt})
+        return conversation
+
+    def get_transfer_solutions_for_reward(self, problem_b: str):
+        chats = [
+            self.tokenizer.apply_chat_template(
+                [
+                    {
+                        "role": "system",
+                        "content": "Please reason step by step, and put your final answer within \\boxed{}.",
+                    },
+                    {"role": "user", "content": problem_b},
+                    {"role": "assistant", "content": solution},
+                ],
+                tokenize=False,
+                add_generation_prompt=False,
+            )
+            for solution in self.transfer_attempts
+        ]
+        return chats
+
+    def add_transfer_attempts(self, attempts: List[str]):
+        self.transfer_attempts = attempts
+
+    def add_transfer_rewards(self, rewards: List[float]):
+        self.transfer_rewards = rewards
+
+    def get_transfer_rm_reward(self):
+        rewards = getattr(self, "transfer_rewards", None)
+        return sum(rewards) / len(rewards) if rewards else None
+
     def add_rewards(self, rewards: List[float]):
         if self.state != ConversationState.REWARD_TURN:
             raise ValueError("We are not in the reward turn state")
@@ -793,6 +834,79 @@ class Classroom:
         elif self.reward_model_cfg.model_name_or_path == "None":
             rewards = [0.0 for _ in prompts]
         return rewards
+
+    def compute_cold_solve_rewards(
+        self, problems: List[str], answers: List[str]
+    ) -> List[float]:
+        """Cold (no-dialogue) solve rate for a batch of problems -- the same
+        mechanism as sample_conversations' compute_initial_attempt path, but
+        factored out standalone so it can be reused as a transfer-test control
+        condition (siblings solved fresh, without any preceding tutoring)."""
+        convs = [
+            Conversation(p, a, self.generation_cfg, None)
+            for p, a in zip(problems, answers)
+        ]
+        messages = [c.get_student_no_tutor_attempt() for c in convs]
+        responses = self.student_model.run_batch(
+            messages, self.sampling_params_student_solution
+        )
+        for c, response in zip(convs, responses):
+            c.add_initial_attempts([output.text for output in response.outputs])
+
+        prompts_for_rewards = [c.get_initial_solutions_for_reward() for c in convs]
+        lengths = [len(prompts) for prompts in prompts_for_rewards]
+        all_prompts = [p for prompts in prompts_for_rewards for p in prompts]
+        all_answers = []
+        for c in convs:
+            all_answers.extend([c.answer] * len(c.initial_attempts))
+
+        rewards = self._compute_rewards_from_prompts(all_prompts, all_answers)
+        out = []
+        for c in convs:
+            curr_len = lengths.pop(0)
+            c.add_initial_rewards(rewards[:curr_len])
+            rewards = rewards[curr_len:]
+            out.append(c.get_initial_rm_reward())
+        return out
+
+    def run_transfer_test(
+        self,
+        conversations: List["Conversation"],
+        problems_b: List[str],
+        answers_b: List[str],
+    ) -> None:
+        """Treatment condition for the transfer test: have the student solve a
+        sibling problem B in-context, right after the just-completed dialogue
+        about problem A. Mutates conversations in place (transfer_attempts /
+        transfer_rewards), mirroring the GENERATE_SOLUTION reward path."""
+        logger.info(("=" * 10) + "Computing transfer-test attempts" + ("=" * 10))
+        messages = [
+            conversation.get_transfer_test_prompt(problem_b)
+            for conversation, problem_b in zip(conversations, problems_b)
+        ]
+        responses = self.student_model.run_batch(
+            messages, self.sampling_params_student_solution
+        )
+        for conversation, response in zip(conversations, responses):
+            conversation.add_transfer_attempts(
+                [output.text for output in response.outputs]
+            )
+
+        prompts_for_rewards = [
+            conversation.get_transfer_solutions_for_reward(problem_b)
+            for conversation, problem_b in zip(conversations, problems_b)
+        ]
+        lengths = [len(prompts) for prompts in prompts_for_rewards]
+        all_prompts = [p for prompts in prompts_for_rewards for p in prompts]
+        all_answers = []
+        for conversation, answer_b in zip(conversations, answers_b):
+            all_answers.extend([answer_b] * len(conversation.transfer_attempts))
+
+        rewards = self._compute_rewards_from_prompts(all_prompts, all_answers)
+        for conversation in conversations:
+            curr_len = lengths.pop(0)
+            conversation.add_transfer_rewards(rewards[:curr_len])
+            rewards = rewards[curr_len:]
 
     def generate_next_teacher_utterances(
         self, conversations: List[Conversation], meta: dict = None

@@ -1,9 +1,9 @@
-# Baseline: TutorRL-7B x UserLM-8b (disengaging student), matched to
-# full_baseline_2x2.sh CELL 1 -- the script that produced the paper's Table 4
-# numbers. gpu_ids / engagement_model / forced_conversation_type=guided /
-# use_v0=false / enforce_eager=true / load_and_unload=false were all set as
-# CLI overrides by that script and are pinned here instead so this config is
-# runnable standalone through run_eval_engagement.sh.
+# Baseline: TutorRL-7B x Llama-3.1-8B (always-engaged, no disengagement
+# dynamics), matched to full_baseline_2x2.sh CELL 2. Runs through eval.py
+# (plain Classroom), NOT eval_engagement.py -- EvalConfig (eval.py's schema)
+# has no engagement_model field at all, so this is a separate file from
+# TutorRL.yaml rather than one shared config: merging a yaml with an
+# engagement_model: block against EvalConfig raises ConfigKeyError.
 teacher_model:
   model_name_or_path: eth-nlped/TutorRL-7B
   use_openrouter: false
@@ -44,20 +44,6 @@ judge_model:
     enforce_eager: true
     load_and_unload: false
 
-engagement_model:
-  model_name_or_path: microsoft/UserLM-8b
-  vllm:
-    temperature: 1.0
-    top_p: 0.8
-    max_length: 8192
-    max_num_seqs: 64
-    gpu_memory_utilization: 0.85
-    number_of_gpus_per_instance: 1
-    gpu_ids: [3]
-    use_v0: false
-    enforce_eager: true
-    load_and_unload: false
-
 reward_model:
   model_name_or_path: "Answer"
 
@@ -71,6 +57,6 @@ score_using_pedagogical_reward: false
 logging:
   wandb: false
   wandb_project: eval
-  wandb_run_name: TutorRL-7B-UserLM
+  wandb_run_name: TutorRL-7B-LlamaAlwaysEngaged
   run_group: tutor
-  wandb_tags: ["tutor", "7b", "userlm"]
+  wandb_tags: ["tutor", "7b", "llama-always-engaged"]

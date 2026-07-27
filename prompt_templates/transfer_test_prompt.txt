@@ -1,0 +1,4 @@
+That problem is finished. Now, on your own and without any help, solve a different problem below.
+Think step by step. It is essential you include the final answer in the \\boxed{} format.
+Here is the problem:
+{{ problem }}

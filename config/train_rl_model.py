@@ -95,6 +95,7 @@ class GenerationConfig:
         "prompt_templates/initial_attempt_wrapper_prompt.txt"
     )
     student_attempt_prompt_path: str = "prompt_templates/student_attempt_prompt.txt"
+    transfer_test_prompt_path: str = "prompt_templates/transfer_test_prompt.txt"
 
     max_turns: int = 15  # Will actually be 16 turns.
     max_tokens_in_conversation: int = 8192
@@ -170,6 +171,9 @@ class TrainConfig:
 
     batch_size_ref_model: int = 4
     save_policy_to_disk_every_n: int = 1
+    # sdpa is the safe default (some flash-attn wheels predate newer GPU
+    # archs); set to "flash_attention_2" on hardware where it's supported.
+    attn_implementation: str = "sdpa"
 
 
 @dataclass

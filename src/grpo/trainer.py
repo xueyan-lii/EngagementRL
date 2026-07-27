@@ -691,20 +691,40 @@ class ClassroomGRPOTrainer(Trainer):
         """
         Save only the model, then delete any other checkpoint-* folders
         under the same `policy` directory so that only the latest remains.
+
+        Saves to a `.tmp` staging directory and atomically renames it to
+        `output_dir` only once fully written. The rollout server polls for
+        `checkpoint-*` directories on every batch and reloads the moment it
+        sees a new one -- the previous version created `output_dir` (via a
+        bare os.makedirs) before writing any weights into it, so a server
+        poll landing in that window would find a checkpoint dir with no
+        valid model files yet and error out (observed: vLLM's loader fell
+        back to treating the local path as a HF Hub repo id and hit
+        HFValidationError) instead of just waiting for the next poll.
+        os.rename on the same filesystem is atomic, so the final
+        `checkpoint-N` name only ever appears fully populated.
         """
         CHECKPOINT_RE = re.compile(r"^checkpoint-\d+$")
-        if self.accelerator.is_main_process:
+        staging_dir = output_dir + ".tmp"
 
-            # Save current model
-            os.makedirs(output_dir, exist_ok=True)
-            # Prune older checkpoints
-            policy_root = os.path.dirname(output_dir)  # …/policy
-            for d in os.listdir(policy_root):
-                if CHECKPOINT_RE.match(d):
-                    shutil.rmtree(os.path.join(policy_root, d), ignore_errors=True)
+        if self.accelerator.is_main_process:
+            shutil.rmtree(staging_dir, ignore_errors=True)
+            os.makedirs(staging_dir, exist_ok=True)
 
         self.accelerator.wait_for_everyone()
-        self.save_model(output_dir, _internal_call=True)
+        self.save_model(staging_dir, _internal_call=True)
+        self.accelerator.wait_for_everyone()
+
+        if self.accelerator.is_main_process:
+            os.rename(staging_dir, output_dir)
+            # Prune older checkpoints only now that the new one is in place.
+            policy_root = os.path.dirname(output_dir)  # …/policy
+            for d in os.listdir(policy_root):
+                full = os.path.join(policy_root, d)
+                if CHECKPOINT_RE.match(d) and full != output_dir:
+                    shutil.rmtree(full, ignore_errors=True)
+
+        self.accelerator.wait_for_everyone()
 
     def _generate_and_score_completions(
         self, inputs: dict[str, Union[torch.Tensor, Any]]

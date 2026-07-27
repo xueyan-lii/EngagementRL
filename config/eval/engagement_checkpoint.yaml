@@ -1,0 +1,91 @@
+# Eval config for our engagement-conditioned GRPO checkpoints, using the same
+# protocol/models as the TutorRL x UserLM baseline (paper Appendix "Baseline:
+# TutorRL under a Disengaging Student"): Llama-3.1-8B knowledge probe,
+# gemma-3-27b-it leak/pedagogy judge, UserLM-8b engagement simulator.
+# teacher_model.model_name_or_path is a placeholder -- always override it per
+# job (see run_eval_engagement.sh), since this config is shared across
+# checkpoints.
+#
+# student_model, and the use_v0/enforce_eager/load_and_unload engine flags on
+# every engine below, are matched to the original baseline's eval script
+# (full_baseline_2x2.sh's `common()`/CELL 1) so our checkpoints and the
+# TutorRL baselines (config/eval/TutorRL.yaml) are on equal footing: that
+# script used the full-precision NousResearch Llama-3.1-8B-Instruct as the
+# knowledge probe, not the neuralmagic FP8 mirror this file pinned before --
+# FP8 quantization measurably shifts solve rate on reasoning tasks.
+teacher_model:
+  model_name_or_path: Qwen/Qwen2.5-7B-Instruct
+  use_openrouter: false
+  vllm:
+    temperature: 0.6
+    max_length: 12000
+    max_num_seqs: 512
+    gpu_memory_utilization: 0.85
+    number_of_gpus_per_instance: 1
+    gpu_ids: [0]
+    use_v0: false
+    enforce_eager: true
+    load_and_unload: false
+
+student_model:
+  model_name_or_path: NousResearch/Meta-Llama-3.1-8B-Instruct
+  vllm:
+    temperature: 0.6
+    max_length: 12000
+    max_num_seqs: 512
+    gpu_memory_utilization: 0.85
+    number_of_gpus_per_instance: 1
+    gpu_ids: [1]
+    use_v0: false
+    enforce_eager: true
+    load_and_unload: false
+
+judge_model:
+  model_name_or_path: google/gemma-3-27b-it
+  vllm:
+    temperature: 0.6
+    max_length: 12000
+    max_num_seqs: 512
+    gpu_memory_utilization: 0.85
+    number_of_gpus_per_instance: 1
+    gpu_ids: [2]
+    use_v0: false
+    enforce_eager: true
+    load_and_unload: false
+
+# EngagementEvalConfig's default is already microsoft/UserLM-8b; pinned here
+# only to fix gpu_ids so it doesn't collide with the other three engines.
+engagement_model:
+  model_name_or_path: microsoft/UserLM-8b
+  vllm:
+    temperature: 1.0
+    top_p: 0.8
+    max_length: 8192
+    max_num_seqs: 64
+    gpu_memory_utilization: 0.85
+    number_of_gpus_per_instance: 1
+    gpu_ids: [3]
+    use_v0: false
+    enforce_eager: true
+    load_and_unload: false
+
+reward_model:
+  model_name_or_path: "Answer"
+
+# Must match how the checkpoint was trained (full_engagement_8xh100.yaml's
+# generation: block) -- EvalConfig's own defaults are forced_conversation_type
+# unset (-> 50/50 GUIDED/ATTEMPTED per src/classroom.py's Conversation.__init__)
+# and use_thinking=False, neither of which match our training-time rollouts,
+# and left half the eval set running an opening-turn structure this checkpoint
+# never trained on. Token budgets must match too -- eval defaults (1024/8192/2048)
+# are ~2x the per-turn/per-conversation budgets the policy was paced against
+# during training, letting it front-load content into fewer, denser turns.
+generation:
+  forced_conversation_type: guided
+  use_thinking: true
+  max_tokens_per_turn: 512
+  max_tokens_in_conversation: 4500
+  max_tokens_per_judge_attempt: 1500
+
+logging:
+  wandb: false  # eval_engagement.py doesn't log to wandb; results print to stdout.

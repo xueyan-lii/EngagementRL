@@ -118,23 +118,12 @@ def sample_conversations(request: ConversationSampleRequest):
     )
 
     if config.logging.wandb:
-        df = classroom.to_pd_latest()
-        df["engagement_reward"] = eng
-        df["learning_reward"] = lea
-        df["disengaged"] = dis
-        df = df[
-            [
-                "Problem",
-                "Answer",
-                "Conversation",
-                "engagement_reward",
-                "learning_reward",
-                "disengaged",
-            ]
-        ].astype(str)
+        # Full rollout transcripts go to the local dialogues/ dump above only
+        # (not wandb) -- a per-batch wandb.Table of every conversation ran up
+        # wandb's storage fast over a 200-step run. Scalar batch metrics still
+        # get logged for the live training curves.
         wandb.log(
             {
-                f"batch_{len(classroom.conversation_sets)}": wandb.Table(dataframe=df),
                 "server/engagement_reward_mean": sum(eng) / len(eng),
                 "server/learning_reward_mean": sum(lea) / len(lea),
                 "server/disengagement_rate": sum(dis) / len(dis),
@@ -179,6 +168,8 @@ def main(cfg: TrainEngagementRLConfig):
     default_config = OmegaConf.structured(TrainEngagementRLConfig)
     cfg = OmegaConf.merge(default_config, cfg)
     config = cfg
+
+    logger.info("Resolved config:\n" + OmegaConf.to_yaml(cfg))
 
     if cfg.logging.wandb:
         wandb.init(

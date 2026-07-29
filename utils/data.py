@@ -1,5 +1,18 @@
+import os
+
 from datasets import load_dataset, Dataset, concatenate_datasets
 from config.train_sft_model import DatasetConfig
+
+
+def _load_one(name_or_path, split):
+    """Load a HF hub dataset, or a local JSONL file / directory of
+    <split>.jsonl files (used by the OSIM-filtered OpenR1 build)."""
+    if name_or_path.endswith((".jsonl", ".json")):
+        return load_dataset("json", data_files=name_or_path, split="train")
+    local = os.path.join(name_or_path, f"{split}.jsonl")
+    if os.path.isdir(name_or_path) and os.path.exists(local):
+        return load_dataset("json", data_files=local, split="train")
+    return load_dataset(name_or_path, split=split)
 
 
 def load_datasets(cfg: DatasetConfig, seed: int) -> Dataset:
@@ -17,7 +30,7 @@ def load_datasets(cfg: DatasetConfig, seed: int) -> Dataset:
 
     try:
         for dataset in cfg.train_datasets:
-            dataset = load_dataset(dataset.name_or_path, split=dataset.split)
+            dataset = _load_one(dataset.name_or_path, dataset.split)
             train_datasets.append(dataset)
 
         # We sample based on max_examples and ratios.
@@ -48,7 +61,7 @@ def load_datasets(cfg: DatasetConfig, seed: int) -> Dataset:
 
     try:
         for dataset in cfg.eval_datasets:
-            dataset = load_dataset(dataset.name_or_path, split=dataset.split)
+            dataset = _load_one(dataset.name_or_path, dataset.split)
             val_datasets.append(dataset)
 
         if len(val_datasets) == 0:

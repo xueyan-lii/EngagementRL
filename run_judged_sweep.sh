@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Judge-only sweep: dialogue-level engagement + learning for every
+# Baseline Judge-only sweep: dialogue-level engagement + learning for
 # (teacher x student-simulator) cell. No solve-rate probe, no transfer test.
 #
 # Cells run SEQUENTIALLY -- each loads three models (teacher/simulator/judge)

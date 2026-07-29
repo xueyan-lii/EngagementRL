@@ -123,26 +123,10 @@ class TrainEngagementClassroom(Classroom):
             log_file_path=log_file_path,
         )
 
-        self.engagement_model = ParallelvLLMInference(
-            model_path=engagement_model_cfg.model_name_or_path,
-            gpu_memory_utilization=engagement_model_cfg.vllm.gpu_memory_utilization,
-            gpu_ids=engagement_model_cfg.vllm.gpu_ids,
-            max_model_len=engagement_model_cfg.vllm.max_length,
-            max_num_seqs=engagement_model_cfg.vllm.max_num_seqs,
-            model_save_path=None,
-            load_and_unload=False,
-            enable_sleep_mode=False,
-            enforce_eager=True,
-            use_v0=False,
-            userlm_mode=True,  # render template + BOS, use .generate()
-        )
-        self.engagement_tokenizer = AutoTokenizer.from_pretrained(
-            engagement_model_cfg.model_name_or_path
-        )
-        self.eot_id = self.engagement_tokenizer.convert_tokens_to_ids("<|eot_id|>")
-        self.endconv_id = self.engagement_tokenizer.convert_tokens_to_ids(
-            END_CONV_TOKEN
-        )
+        # Overridable so a different simulator (see train_osim_classroom.py)
+        # can swap the engine flags, tokenizer and stop tokens without
+        # duplicating this whole constructor.
+        self._setup_engagement_model(engagement_model_cfg)
 
         self.judge_model = ParallelvLLMInference(
             model_path=judge_model_cfg.model_name_or_path,
@@ -172,13 +156,8 @@ class TrainEngagementClassroom(Classroom):
                 "\nuser:", "\nstudent:",
             ],
         )
-        # UserLM per its model card; both <|eot_id|> and <|endconversation|>
-        # must stop generation or the model drifts into assistant-style text.
-        self.sampling_params_engagement = SamplingParams(
-            temperature=engagement_model_cfg.vllm.temperature,
-            top_p=engagement_model_cfg.vllm.top_p,
-            max_tokens=generation_cfg.max_tokens_per_turn,
-            stop_token_ids=[self.eot_id, self.endconv_id],
+        self.sampling_params_engagement = self._build_engagement_sampling_params(
+            engagement_model_cfg, generation_cfg
         )
         self.sampling_params_judge = SamplingParams(
             temperature=judge_model_cfg.vllm.temperature,
@@ -191,6 +170,40 @@ class TrainEngagementClassroom(Classroom):
     # ------------------------------------------------------------------
     # UserLM student turns (same construction as the eval classroom)
     # ------------------------------------------------------------------
+
+    def _setup_engagement_model(self, engagement_model_cfg):
+        """UserLM-8b: its chat template omits the BOS the Llama base expects,
+        so userlm_mode renders the template and prepends BOS manually."""
+        self.engagement_model = ParallelvLLMInference(
+            model_path=engagement_model_cfg.model_name_or_path,
+            gpu_memory_utilization=engagement_model_cfg.vllm.gpu_memory_utilization,
+            gpu_ids=engagement_model_cfg.vllm.gpu_ids,
+            max_model_len=engagement_model_cfg.vllm.max_length,
+            max_num_seqs=engagement_model_cfg.vllm.max_num_seqs,
+            model_save_path=None,
+            load_and_unload=False,
+            enable_sleep_mode=False,
+            enforce_eager=True,
+            use_v0=False,
+            userlm_mode=True,  # render template + BOS, use .generate()
+        )
+        self.engagement_tokenizer = AutoTokenizer.from_pretrained(
+            engagement_model_cfg.model_name_or_path
+        )
+        self.eot_id = self.engagement_tokenizer.convert_tokens_to_ids("<|eot_id|>")
+        self.endconv_id = self.engagement_tokenizer.convert_tokens_to_ids(
+            END_CONV_TOKEN
+        )
+
+    def _build_engagement_sampling_params(self, engagement_model_cfg, generation_cfg):
+        """UserLM per its model card; both <|eot_id|> and <|endconversation|>
+        must stop generation or the model drifts into assistant-style text."""
+        return SamplingParams(
+            temperature=engagement_model_cfg.vllm.temperature,
+            top_p=engagement_model_cfg.vllm.top_p,
+            max_tokens=generation_cfg.max_tokens_per_turn,
+            stop_token_ids=[self.eot_id, self.endconv_id],
+        )
 
     def _opening_turn(self, conv: Conversation) -> str:
         return (

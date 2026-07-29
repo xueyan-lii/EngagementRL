@@ -24,6 +24,7 @@ from pydantic import BaseModel
 
 from config.train_rl_engagement_model import TrainEngagementRLConfig
 from train_engagement_classroom import TrainEngagementClassroom
+from train_osim_classroom import TrainOsimClassroom
 from src.classroom import Conversation
 from src.utils.utils import init_logger
 
@@ -186,7 +187,10 @@ def main(cfg: TrainEngagementRLConfig):
             config=OmegaConf.to_object(cfg),
         )
 
-    classroom = TrainEngagementClassroom(
+    # simulator selects the in-dialogue student. Only the classroom changes;
+    # the reward path is shared, so the two are a controlled pair.
+    simulator = getattr(cfg, "simulator", "userlm")
+    kwargs = dict(
         teacher_model_cfg=cfg.teacher_model,
         engagement_model_cfg=cfg.engagement_model,
         judge_model_cfg=cfg.judge_model,
@@ -194,6 +198,14 @@ def main(cfg: TrainEngagementRLConfig):
         model_save_path=os.path.join(cfg.logging.save_dir, "policy"),
         leak_multiplier=cfg.reward.leak_multiplier,
     )
+    if simulator == "osim":
+        logger.info(f"Simulator: OSIM (persona {cfg.persona_path})")
+        classroom = TrainOsimClassroom(persona_path=cfg.persona_path, **kwargs)
+    elif simulator == "userlm":
+        logger.info("Simulator: UserLM-8b")
+        classroom = TrainEngagementClassroom(**kwargs)
+    else:
+        raise ValueError(f"Unknown simulator {simulator!r}")
 
     uvicorn.run(app, host="0.0.0.0", port=cfg.generation.server_port)
 

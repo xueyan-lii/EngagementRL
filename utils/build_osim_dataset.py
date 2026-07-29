@@ -206,6 +206,7 @@ def stage_assemble(args):
     print(f"  unique problems: {len(uniq)}")
 
     keep = [r for r in uniq if KEEP_LO < r["osim_solve_rate"] < KEEP_HI]
+    print(f"  band: {KEEP_LO} < osim_solve_rate < {KEEP_HI}")
     at_floor = sum(1 for r in uniq if r["osim_solve_rate"] == 0)
     at_ceil = sum(1 for r in uniq if r["osim_solve_rate"] >= KEEP_HI)
     print(f"  rate==0 (unteachable floor): {at_floor} ({at_floor/len(uniq):.1%})")
@@ -249,9 +250,23 @@ def main():
     ap.add_argument("--chunk", type=int, default=1000)
     ap.add_argument("--restart", action="store_true")
     ap.add_argument("--test-size", type=int, default=500)
+    ap.add_argument("--keep-lo", type=float, default=None,
+                    help="lower solve-rate bound, EXCLUSIVE. Default 0.0 excludes "
+                         "problems OSIM never solves. Pass -1 to INCLUDE them: "
+                         "under an LM-judged learning reward (which scores "
+                         "student-produced progress inside the dialogue) and a "
+                         "teacher holding the reference solution, rate-0 problems "
+                         "are the target population, not a floor. Only a "
+                         "solve-rate-delta metric needs them excluded.")
+    ap.add_argument("--keep-hi", type=float, default=None)
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--out", default="data/openr1_osim")
     args = ap.parse_args()
+    global KEEP_LO, KEEP_HI
+    if args.keep_lo is not None:
+        KEEP_LO = args.keep_lo
+    if args.keep_hi is not None:
+        KEEP_HI = args.keep_hi
     {"prefilter": stage_prefilter, "score": stage_score,
      "assemble": stage_assemble}[args.stage](args)
 

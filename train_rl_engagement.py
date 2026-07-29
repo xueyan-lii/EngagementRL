@@ -96,7 +96,11 @@ def main(cfg: TrainEngagementRLConfig):
     logger.info(f"Loaded {len(train_dataset)} training examples")
 
     train_dataset: Dataset = train_dataset.map(
-        lambda ex: {"prompt": ex["problem"], "answer": ex["answer"]},
+        # `solution` is carried through when present so the teacher prompt can
+        # render its reference-solution block. Datasets without the column pass
+        # None and the block stays empty.
+        lambda ex: {"prompt": ex["problem"], "answer": ex["answer"],
+                    "solution": ex.get("solution")},
         num_proc=4,
         desc="Applying template",
     )

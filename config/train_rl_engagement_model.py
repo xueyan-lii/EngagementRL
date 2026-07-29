@@ -37,3 +37,7 @@ class TrainEngagementRLConfig(RLModelTrainingConfig):
         )
     )
     reward: EngagementRewardConfig = field(default_factory=EngagementRewardConfig)
+    # Which model drives the in-dialogue student turns: "userlm" or "osim".
+    simulator: str = "userlm"
+    # OSIM only: persona placed in the system slot alongside the problem.
+    persona_path: str = "prompt_templates/personas/osim_passive.txt"

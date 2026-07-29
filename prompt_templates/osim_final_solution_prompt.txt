@@ -1,0 +1,4 @@
+That's all the time we have today. One last thing before you go: write out the
+complete solution from scratch, all the steps, as if you were writing it up for your
+problem set and nobody could see this conversation. Put your final answer in
+\boxed{}.

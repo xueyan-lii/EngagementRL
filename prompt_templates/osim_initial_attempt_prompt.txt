@@ -1,0 +1,10 @@
+Before we start working through this together, I want to see where you're at with it
+on your own.
+
+Here is the problem:
+
+{{ problem }}
+
+Have a go at the whole thing yourself first -- write out your steps, and put your
+final answer in \boxed{}. If you're not sure how to finish it, write down as much as
+you can work out and still put your best guess for the final answer in \boxed{}.

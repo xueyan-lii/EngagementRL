@@ -262,12 +262,17 @@ class TrainEngagementClassroom(Classroom):
     # Rollout
     # ------------------------------------------------------------------
 
-    def sample_conversations(self, problems, answers, meta: dict = {}):
+    def sample_conversations(self, problems, answers, meta: dict = {},
+                             solutions=None):
+        # solutions is positionally aligned with problems; None disables the
+        # reference-solution block in the teacher prompt.
+        sols = solutions if solutions is not None else [None] * len(problems)
         conversations = []
-        for problem, answer in zip(problems, answers):
+        for problem, answer, sol in zip(problems, answers, sols):
             conv = Conversation(
                 problem, answer, self.generation_cfg,
                 forced_type=ConversationType.GUIDED,
+                reference_solution=sol,
             )
             conv.disengaged = False
             conv.disengage_reason = None
@@ -399,7 +404,14 @@ class TrainEngagementClassroom(Classroom):
     # ------------------------------------------------------------------
 
     def get_engagement_reward(self, conversation: Conversation) -> float:
-        return engagement_scalar(getattr(conversation, "turn_scores", []))
+        # max_turns counts TOTAL messages (both roles) and is only checked
+        # after a teacher turn, so a teacher-first GUIDED dialogue affords
+        # max_turns//2 student turns -- that, not max_turns, is the capacity
+        # the engagement sum is normalized against.
+        return engagement_scalar(
+            getattr(conversation, "turn_scores", []),
+            max_student_turns=self.generation_cfg.max_turns // 2,
+        )
 
     def get_learning_reward(self, conversation: Conversation) -> float:
         scores = getattr(conversation, "learning_scores", None)

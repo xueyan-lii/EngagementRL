@@ -15,7 +15,14 @@ class EngagementRewardConfig:
     learning_weight: float = 1.0
     # Multiplier applied to the learning reward when the terminal judge flags
     # tutor leakage (tutor_leaked). 0.0 = leaking forfeits all learning credit.
-    leak_multiplier: float = 0.0
+    # 1.0 = gate OFF. Leakage is no longer a headline metric (it is TutorRL's
+    # focus, not ours), and the terminal learning rubric's EVIDENCE RULE already
+    # penalises tutor-stated answers per-dimension. The multiplicative gate on
+    # top of that was firing on ~70% of dialogues lasting more than one turn
+    # (measured over 3840 v3 training dialogues) and is anti-correlated with
+    # engagement -- it zeroed learning precisely on the long, engaged dialogues
+    # the objective is trying to produce. Leak rate is still recorded.
+    leak_multiplier: float = 1.0
 
 
 @dataclass

@@ -420,7 +420,10 @@ class ClassroomGRPOTrainer(Trainer):
 
     def _set_signature_columns_if_needed(self):
         if self._signature_columns is None:
-            self._signature_columns = ["prompt", "answer"]
+            # "solution" is optional: datasets without a worked-solution
+            # column simply yield None and the teacher prompt's
+            # {% if reference_solution %} block stays empty.
+            self._signature_columns = ["prompt", "answer", "solution"]
 
     def get_train_dataloader(self):
         if self.train_dataset is None:
@@ -735,6 +738,7 @@ class ClassroomGRPOTrainer(Trainer):
         inputs = sorted(inputs, key=lambda x: str(x))
         prompts = [x["prompt"] for x in inputs]
         answers = [x["answer"] for x in inputs]
+        solutions = [x.get("solution") for x in inputs]
         prompts_text = [
             maybe_apply_chat_template(example, self.processing_class)["prompt"]
             for example in inputs
@@ -806,6 +810,7 @@ class ClassroomGRPOTrainer(Trainer):
             logger.info(f"Entered with {len(all_prompts_text)} prompts")
             ordered_set_of_prompts = all_prompts_text[:: self.num_generations]
             local_answers = answers[:: self.num_generations]
+            local_solutions = solutions[:: self.num_generations]
 
             num_prompts_per_node = len(ordered_set_of_prompts) // self.num_nodes
 
@@ -814,11 +819,18 @@ class ClassroomGRPOTrainer(Trainer):
             end_slice = (self.node_id + 1) * num_prompts_per_node
             ordered_set_of_prompts = ordered_set_of_prompts[start_slice:end_slice]
             local_answers = local_answers[start_slice:end_slice]
+            local_solutions = local_solutions[start_slice:end_slice]
             # we duplicate the answers by num_generations
             real_answers = []
             for answer in local_answers:
                 for _ in range(self.num_generations):
                     real_answers.append(answer)
+            # Same duplication for solutions so they stay positionally aligned
+            # with problems/answers across the num_generations expansion.
+            real_solutions = []
+            for solution in local_solutions:
+                for _ in range(self.num_generations):
+                    real_solutions.append(solution)
 
             logger.info(
                 f"Generating completions for {len(ordered_set_of_prompts)} unique problems, with {self.num_generations} generations each and answers {real_answers}"
@@ -831,6 +843,7 @@ class ClassroomGRPOTrainer(Trainer):
                 server_port=self.server_port,
                 num_samples_per_problem=self.num_generations,
                 tokenizer=self.processing_class,  # .tokenizer removed in transformers 5
+                solutions=real_solutions,
             )
             logger.info(f"Generated completions for {len(all_outputs)} prompts")
 

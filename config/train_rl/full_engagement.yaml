@@ -1,6 +1,6 @@
 # Full engagement-conditioned GRPO run.
-# GPUs (0/5/6 belong to other users): trainer on 1,2,3 (zero2/3ranks — Adam
-# fp32 state + ref model need the extra shard); teacher->4, UserLM+judge->7.
+# GPUs (0/5/6 other users; 1 partially squatted since 2026-07-22): trainer on
+# 2,3,7 (zero2/3ranks); teacher+UserLM+judge all co-located on 4 (0.38/0.26/0.26).
 # v1: beta=0.001 + scale_rewards=False after v0 policy collapse (no-KL +
 # std-normalized advantages amplified noise once rewards dipped).
 
@@ -25,8 +25,8 @@ teacher_model:
     top_k: 50
     top_p: 1.0
     max_length: 8192
-    max_num_seqs: 64
-    gpu_memory_utilization: 0.85
+    max_num_seqs: 48
+    gpu_memory_utilization: 0.38
     gpu_ids: [4]
     load_and_unload: false
     enable_sleep_mode: false
@@ -39,9 +39,9 @@ engagement_model:
     temperature: 1.0   # UserLM model card
     top_p: 0.8
     max_length: 8192   # UserLM's max_position_embeddings cap
-    max_num_seqs: 64
-    gpu_memory_utilization: 0.30
-    gpu_ids: [7]
+    max_num_seqs: 24
+    gpu_memory_utilization: 0.26
+    gpu_ids: [4]
     load_and_unload: false
     enable_sleep_mode: false
     use_v0: false
@@ -54,9 +54,9 @@ judge_model:
     top_k: -1
     top_p: 1.0
     max_length: 16384
-    max_num_seqs: 64
-    gpu_memory_utilization: 0.50
-    gpu_ids: [7]
+    max_num_seqs: 32
+    gpu_memory_utilization: 0.26
+    gpu_ids: [4]
     load_and_unload: false
     enable_sleep_mode: false
     use_v0: false
@@ -65,7 +65,8 @@ judge_model:
 reward:
   engagement_weight: 0.5
   learning_weight: 1.0
-  leak_multiplier: 0.0   # judge flags tutor_leaked -> learning reward x this
+  leak_multiplier: 1.0   # 1.0 = gate off; EVIDENCE RULE in the learning rubric
+                         # already penalises leakage. Rate still logged.
 
 dataset:
   max_train_examples: -1   # full Big-Math train split, shuffled (seed 42)

@@ -80,9 +80,17 @@ class Conversation:
         generation_cfg: GenerationConfig,
         forced_type: ConversationType = None,
         forced_student_name: str = None,
+        reference_solution: str = None,
     ):
         self.problem = problem
         self.answer = answer
+        # Optional worked solution shown ONLY to the teacher, via the
+        # {% if reference_solution %} block in teacher_prompt_with_solution.txt.
+        # teacher_prompt.txt ignores the variable, so passing it is harmless
+        # when the plain template is configured. The student never sees it:
+        # it lives in system_prompt_teacher, which no student-perspective or
+        # judge-facing path reads.
+        self.reference_solution = reference_solution
         self.generation_cfg = generation_cfg
         self.conversation = []  # list of dicts: {role: str, content: str}
         self.state = ConversationState.START
@@ -115,6 +123,7 @@ class Conversation:
             student_name=self.student_name,
             problem=problem,
             include_thinking=generation_cfg.use_thinking,
+            reference_solution=reference_solution,
         )
         self.system_prompt_student_attempt = read_template(
             generation_cfg.student_initial_attempt_prompt_path
@@ -684,7 +693,12 @@ class Classroom:
             )
         self.teacher_model.sleep()
 
-        if self.student_model_cfg.use_openrouter:
+        # skip_student_model: the knowledge probe is only needed for pre/post
+        # solve rate. Judge-only evals (eval_judged.py) never call it, so
+        # loading it would waste a GPU and several minutes per run.
+        if getattr(generation_cfg, "skip_student_model", False):
+            self.student_model = None
+        elif self.student_model_cfg.use_openrouter:
             self.student_model = OpenRouterInference(
                 self.student_model_cfg.model_name_or_path
             )
@@ -947,6 +961,7 @@ class Classroom:
         forced_type: ConversationType = None,
         meta: dict = {},
         compute_initial_attempt: bool = False,
+        solutions: List[str] = None,
     ) -> List[Conversation]:
         # If we force a certain type of conversation we set it here.
         if forced_type is None:
@@ -957,14 +972,18 @@ class Classroom:
             else:
                 forced_type = None
 
+        # solutions is optional and positionally aligned with problems; None
+        # means "no reference solution", which the teacher template ignores.
+        sols = solutions if solutions is not None else [None] * len(problems)
         conversations = []
-        for problem, answer in tqdm(
-            zip(problems, answers),
+        for problem, answer, sol in tqdm(
+            zip(problems, answers, sols),
             total=len(problems),
             desc="Initializing conversations",
         ):
             conversations.append(
-                Conversation(problem, answer, self.generation_cfg, forced_type)
+                Conversation(problem, answer, self.generation_cfg, forced_type,
+                             reference_solution=sol)
             )
 
         # Start the conversations.

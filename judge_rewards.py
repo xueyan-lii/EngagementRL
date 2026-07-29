@@ -289,10 +289,28 @@ ZERO_ENGAGEMENT_SCORES = {**{k: 0 for k in ENGAGEMENT_DIMS}, "role_drift": False
 # Scalar rewards in [0,1]
 # ---------------------------------------------------------------------------
 
-def engagement_scalar(turn_scores):
-    """Mean over student turns of (behavioral+affective+cognitive)/12.
-    Turns the judge flagged as assistant role-drift are excluded (simulator
-    noise, neither rewarded nor penalized). Empty/all-drifted -> 0."""
+def engagement_scalar(turn_scores, max_student_turns=None):
+    """Summed per-turn engagement (behavioral+affective+cognitive)/12,
+    normalized by the maximum number of student turns the episode could have
+    had rather than by the number it actually had.
+
+    Why not a plain mean: a mean is length-blind, so a dialogue where the
+    student leaves after one turn scores the same as one where they stayed for
+    seven at equal per-turn quality. Only *silent* exits were penalized (via
+    ZERO_ENGAGEMENT_SCORES); a student who signs off with real text
+    ("thanks, got it") kept full credit. Normalizing by the episode's capacity
+    makes turns the student never took forfeit their credit, which is the
+    closest a judge-only reward gets to the survival factor in the
+    multiplicative objective.
+
+    Turns the judge flagged as assistant role-drift are excluded from BOTH the
+    numerator and the denominator, preserving the existing decision that drift
+    is simulator noise -- neither rewarded nor penalized. Were they left in the
+    denominator, a drifted turn would silently cost reward.
+
+    max_student_turns=None keeps the original mean-over-actual-turns behaviour
+    (used by callers that have no generation config to hand).
+    """
     kept = [t for t in turn_scores if not t.get("role_drift", False)]
     if not kept:
         return 0.0
@@ -300,7 +318,13 @@ def engagement_scalar(turn_scores):
         (t["behavioral"] + t["affective"] + t["cognitive"]) / 12.0
         for t in kept
     ]
-    return sum(vals) / len(vals)
+    if max_student_turns is None:
+        return sum(vals) / len(vals)
+    n_drifted = len(turn_scores) - len(kept)
+    denom = max(1, max_student_turns - n_drifted)
+    # Clamp: a conversation cannot exceed its own capacity, but token-budget
+    # truncation and odd max_turns values make this worth asserting cheaply.
+    return min(1.0, sum(vals) / denom)
 
 
 def learning_scalar(scores):
@@ -312,3 +336,69 @@ def learning_scalar(scores):
     if scores["misconception_repair"] >= 0:
         dims.append(scores["misconception_repair"])
     return sum(dims) / (4.0 * len(dims))
+
+
+# ---------------------------------------------------------------------------
+# Reusable scoring over completed dialogues (shared by training rewards and
+# eval metrics, so the eval numbers use the SAME rubrics as the reward).
+# ---------------------------------------------------------------------------
+
+def judge_dialogues(run_batch, dialogues, problems, answers):
+    """Score completed dialogues with both training rubrics.
+
+    run_batch: callable(list_of_chat_message_lists) -> list of raw text outputs.
+        Supplied by the caller so this stays free of any model/vLLM dependency.
+    dialogues: list of [{'role': 'teacher'|'student', 'content': str}], with
+        thinking already stripped (pass Conversation._get_hidden_conversation()).
+
+    Returns (turn_scores_per_dialogue, learning_scores_per_dialogue). The
+    per-turn engagement scores are computed because that is what the validated
+    rubric rates, but callers reporting eval metrics should aggregate them to
+    one number per dialogue via engagement_scalar() rather than reporting turns.
+
+    Unparsable judge outputs get one retry, then fall back to the same defaults
+    the training path uses, so a judge hiccup cannot silently skew a mean.
+    """
+    def _batch(messages, extractor, defaults):
+        if not messages:
+            return []
+        parsed = [extractor(t) for t in run_batch(messages)]
+        fail = [i for i, p in enumerate(parsed) if p is None]
+        if fail:
+            retry = run_batch([messages[i] for i in fail])
+            for i, t in zip(fail, retry):
+                parsed[i] = extractor(t)
+        return [p if p is not None else dict(defaults) for p in parsed]
+
+    # ---- per-turn engagement (aggregated by the caller) ----
+    eng_messages, slots = [], []
+    turn_scores = [[] for _ in dialogues]
+    for di, turns in enumerate(dialogues):
+        for i, m in enumerate(turns):
+            if m["role"] != "student":
+                continue
+            if not m["content"].strip():
+                turn_scores[di].append(dict(ZERO_ENGAGEMENT_SCORES))
+                continue
+            eng_messages.append([
+                {"role": "system", "content": ENGAGEMENT_SYSTEM_PROMPT},
+                {"role": "user",
+                 "content": build_engagement_user_prompt(turns[:i], m["content"])},
+            ])
+            slots.append((di, len(turn_scores[di])))
+            turn_scores[di].append(None)
+
+    for (di, idx), scores in zip(
+        slots, _batch(eng_messages, extract_engagement_scores,
+                      DEFAULT_ENGAGEMENT_SCORES)):
+        turn_scores[di][idx] = scores
+
+    # ---- terminal learning outcome ----
+    learn_messages = [
+        [{"role": "system", "content": LEARNING_SYSTEM_PROMPT},
+         {"role": "user", "content": build_learning_user_prompt(p, a, turns)}]
+        for p, a, turns in zip(problems, answers, dialogues)
+    ]
+    learning_scores = _batch(learn_messages, extract_learning_scores,
+                             DEFAULT_LEARNING_SCORES)
+    return turn_scores, learning_scores

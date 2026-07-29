@@ -1,0 +1,99 @@
+# TutorRL-7B x OSIM with OSIM ALSO as the knowledge probe -- no Llama anywhere
+# in the learning measurement.
+#
+# Rationale: Llama-3.1-8B is an assistant model. The post-dialogue and transfer
+# probes hand it a full tutoring transcript as context, which is out of
+# distribution for it and degrades its problem solving. That contaminates every
+# learning number it produces: the post-dialogue solve rate, and especially the
+# transfer test, whose treatment arm differs from its control by the presence of
+# ~12 messages of dialogue as well as by the tutoring itself. Using the same
+# user model that produced the dialogue keeps the context in distribution.
+#
+# OSIM answers the neutral probe prompts at 0.75 correct out of persona vs a
+# 0.88 boxed-extraction rate (logs/osim_solve_probe_v2.json), so it is a
+# capable probe -- but a much stronger one than Llama (0.276 pre-dialogue on
+# this set), so pre-dialogue solve rate will rise sharply and Delta will have
+# less headroom. Numbers are NOT comparable to the Llama-probe runs; this is a
+# different instrument, deliberately.
+#
+# Two variables change relative to config/eval/TutorRL-osim.yaml (probe model
+# AND persona). Override persona_path on the CLI to isolate one at a time.
+teacher_model:
+  model_name_or_path: eth-nlped/TutorRL-7B
+  use_openrouter: false
+  vllm:
+    temperature: 0.6
+    max_length: 12000
+    max_num_seqs: 512
+    gpu_memory_utilization: 0.85
+    number_of_gpus_per_instance: 1
+    gpu_ids: [0]
+    use_v0: false
+    enforce_eager: true
+    load_and_unload: false
+
+# Knowledge probe = OSIM, out of persona (the probe prompts are the neutral
+# TutorRL ones; the persona applies only to in-dialogue turns).
+student_model:
+  model_name_or_path: cmu-lti/osim-8b
+  vllm:
+    temperature: 0.6
+    max_length: 8192
+    max_num_seqs: 512
+    gpu_memory_utilization: 0.85
+    number_of_gpus_per_instance: 1
+    gpu_ids: [2]
+    use_v0: false
+    enforce_eager: true
+    load_and_unload: false
+
+judge_model:
+  model_name_or_path: Qwen/Qwen3.6-27B
+  vllm:
+    temperature: 0.6
+    max_length: 12000
+    max_num_seqs: 512
+    gpu_memory_utilization: 0.85
+    number_of_gpus_per_instance: 1
+    gpu_ids: [3]
+    use_v0: false
+    enforce_eager: true
+    load_and_unload: false
+
+engagement_model:
+  model_name_or_path: cmu-lti/osim-8b
+  vllm:
+    temperature: 1.0
+    top_p: 0.8
+    max_length: 8192
+    max_num_seqs: 64
+    gpu_memory_utilization: 0.85
+    number_of_gpus_per_instance: 1
+    gpu_ids: [5]
+    use_v0: false
+    enforce_eager: true
+    load_and_unload: false
+
+reward_model:
+  model_name_or_path: "Answer"
+
+simulator: osim
+# Rewritten persona: the earlier osim_passive.txt produced brevity but not
+# disaffection (median 29-char turns, but compliant and correct 46% of the
+# time, and 1/500 disengagement). This one specifies resistance behaviours
+# rather than terseness.
+persona_path: prompt_templates/personas/osim_disengaged.txt
+
+generation:
+  forced_conversation_type: guided
+  max_turns: 15
+  number_student_attempts: 8
+
+score_using_pedagogical_reward: false
+
+logging:
+  wandb: false
+  wandb_project: eval
+  wandb_run_name: TutorRL-7B-OSIM-osimprobe
+  run_group: tutor
+  wandb_tags: ["tutor", "7b", "osim", "osim-probe"]

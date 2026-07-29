@@ -4,3 +4,5 @@ outputs
 .env
 __pycache__
 checkpoints
+logs/
+data/

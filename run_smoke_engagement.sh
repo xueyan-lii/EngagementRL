@@ -19,7 +19,7 @@ case "${1:-}" in
     ;;
   train)
     export PYTHONUNBUFFERED=1
-    export CUDA_VISIBLE_DEVICES=1,2,3
+    export CUDA_VISIBLE_DEVICES=2,3,7
     export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
     exec ../.venv-train/bin/accelerate launch \
       --config_file config/deepspeed/zero2_3GPU.yaml \

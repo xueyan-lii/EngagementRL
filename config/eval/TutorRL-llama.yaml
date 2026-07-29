@@ -32,7 +32,7 @@ student_model:
     load_and_unload: false
 
 judge_model:
-  model_name_or_path: google/gemma-3-27b-it
+  model_name_or_path: Qwen/Qwen3.6-27B
   vllm:
     temperature: 0.6
     max_length: 12000

@@ -17,6 +17,7 @@ def sample_conversations(
     server_port: int = 8000,
     num_samples_per_problem: int = 1,
     tokenizer: PreTrainedTokenizer = None,
+    solutions: List[str] = None,
 ) -> List[RequestOutput]:
     server_url = f"http://localhost:{server_port}/sample_conversations"
 
@@ -24,9 +25,12 @@ def sample_conversations(
     for problem in problems:
         actual_problems.extend([problem] * num_samples_per_problem)
     answers = [str(answer) for answer in answers]
-    response = requests.post(
-        server_url, json={"problems": actual_problems, "meta": meta, "answers": answers}
-    )
+    payload = {"problems": actual_problems, "meta": meta, "answers": answers}
+    # `answers` arrives already expanded by num_samples_per_problem (the caller
+    # duplicates it), so `solutions` must be too -- it is passed through as-is.
+    if solutions is not None and any(s is not None for s in solutions):
+        payload["solutions"] = [None if s is None else str(s) for s in solutions]
+    response = requests.post(server_url, json=payload)
     response.raise_for_status()
 
     response_list = response.json()

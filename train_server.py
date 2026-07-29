@@ -11,7 +11,7 @@ import json
 import os
 import threading
 import warnings
-from typing import List
+from typing import List, Optional
 
 import hydra
 import uvicorn
@@ -45,6 +45,10 @@ class ConversationSampleRequest(BaseModel):
     problems: List[str]
     answers: List[str]
     meta: dict = {}
+    # Worked reference solutions, positionally aligned with `problems`. Shown
+    # only to the teacher (see Conversation.reference_solution). Optional so
+    # datasets without a solution column keep working unchanged.
+    solutions: Optional[List[str]] = None
 
 
 class RewardRequest(BaseModel):
@@ -57,7 +61,8 @@ def sample_conversations(request: ConversationSampleRequest):
 
     with lock:
         conversations = classroom.sample_conversations(
-            problems=request.problems, answers=request.answers, meta=request.meta
+            problems=request.problems, answers=request.answers, meta=request.meta,
+            solutions=request.solutions,
         )
 
     eng = [classroom.get_engagement_reward(c) for c in conversations]

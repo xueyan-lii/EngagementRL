@@ -163,3 +163,145 @@ The original 3-dimension rubric used for the 7-corpus real-vs-LLM study
 (§motivation-judge, Appendix app:judge). Identical to item 3 minus
 `learning_evidence`/`role_drift`. Keep this one frozen — its scores are
 already in the paper.
+
+---
+
+# OSIM migration: which prompts are actually in play
+
+Orientation for the OdysSim (`cmu-lti/osim-8b`) student simulator. Most prompts
+carry over unchanged from the UserLM setup; the table says what each one does
+and whether OSIM touches it.
+
+## The RL training loop needs exactly five prompts
+
+| slot | file / symbol | changes for OSIM? |
+|------|---------------|-------------------|
+| Tutor policy (system) | `prompt_templates/teacher_prompt.txt` | **No** — unchanged, it is the thing being trained |
+| Student persona (system, OSIM side) | `prompt_templates/personas/osim_passive.txt` | **Yes, new** — replaces UserLM's one-line `INTENT` |
+| Per-turn engagement judge | `judge_rewards.py::ENGAGEMENT_SYSTEM_PROMPT` | Review only (see below) |
+| Terminal learning judge | `judge_rewards.py::LEARNING_SYSTEM_PROMPT` | Review only (see below) |
+| Teacher stop-strings (v2 anti-hack) | `train_engagement_classroom.py::sampling_params_teacher` | **No** |
+
+Nothing else is loaded during a training rollout.
+
+## Role mapping is inverted vs UserLM
+
+UserLM sat in the `user` role with the policy as `assistant`. OSIM is the
+opposite -- it imitates the human but *generates* the `assistant` role:
+
+    system    = the persona describing the student   (osim_passive.txt)
+    user      = the tutor's turns                    (the policy's output)
+    assistant = the simulated student's own turns
+
+Two mechanical consequences in `train_engagement_classroom.py`:
+`_build_userlm_messages` must map teacher->`user` and student->`assistant`
+(currently the reverse), and `ParallelvLLMInference(userlm_mode=...)` must be
+**False** -- that flag exists only to prepend a BOS that UserLM's template
+omits; OSIM is stock Qwen3 ChatML and takes the normal `llm.chat` path.
+
+## DECIDED: the problem enters via OSIM's system prompt
+
+Under UserLM the problem arrived through a synthetic student-first opening turn
+(`_opening_turn`), which existed to keep UserLM in its student-first training
+distribution. OSIM has no such constraint -- a GUIDED conversation is already
+teacher-first, which is exactly OSIM's natural `user`-then-`assistant` order --
+but that opening was also how the problem text got in front of the student.
+
+**Design A (system_only): append the problem to the persona in OSIM's `system`
+slot.** No synthetic turn, no harness-injected tutor text.
+
+```python
+system = f"{persona}\n\nThe problem you are working on:\n\n{problem}"
+messages = [{"role": "system",    "content": system}]
+          + [{"role": "user",     "content": <tutor turn>},      # policy output
+             {"role": "assistant","content": <student turn>}, ...]
+```
+
+`persona` = `prompt_templates/personas/osim_passive.txt`. Nothing else is
+prepended: the tutor speaks first and the student replies, which is both the
+canonical GUIDED order and OSIM's native turn order.
+
+### Why, and what was rejected
+
+Measured in `utils/osim_problem_entry_probe.py` (n=40 problems x 2 real dialogue
+turns against the actual Qwen2.5-7B teacher policy); results in
+`logs/osim_problem_entry.json`. Grounding = share of numbers in the student's
+turn that actually occur in the problem, measured on the discriminating subset
+where the teacher restated <20% of the problem's numbers.
+
+| condition | grounding | verdict |
+|---|---:|---|
+| A system_only | 0.44 | **adopted** |
+| B tutor_only | 0.21 | rejected -- student invents its own problem |
+| C tutor_explicit | 0.40 | rejected on design grounds (see below) |
+| D synthetic_opening | 0.44 | rejected on design grounds (see below) |
+
+- **B fails outright.** The teacher restates only 45% of the problem's numbers
+  on average and fully restates just 26% of the time, so three quarters of
+  dialogues would open with a student who does not know the task. Observed
+  directly: problem states first term 1783 / last term 1993, teacher gives the
+  formula without the numbers, and the B student answers
+  *"I got 20 = 10 + 10d and 24 = 10 + 14d"* -- a fabricated problem. The same
+  dialogue under A: *"I plug in 1783 for a1 and 1993 for an."*
+- **C is disqualified for RL specifically.** It has the harness prefix the
+  problem onto the tutor's *visible* turn, so the terminal learning judge would
+  score a transcript containing text the policy never generated and
+  credit-assign it to the policy. That is a credit-assignment bug, not a style
+  preference.
+- **D works empirically but fabricates a student turn.** Under UserLM that turn
+  was view-only and never entered `conv.conversation`, so no judge saw it;
+  preserving that invariant for OSIM is extra machinery for no measured gain
+  over A.
+
+Caveat on the metric: grounding counts a student's legitimately chosen test
+value as ungrounded (*"I'll start with n=10"* scores 0.0 under every condition),
+so 0.44 understates A. The B-vs-A contrast, not the absolute level, is what
+carries the conclusion.
+
+## Judge prompts: carry over, but two known soft spots
+
+Both judges are transcript-only and model-agnostic, so they run against OSIM
+unchanged. Two things to re-check rather than assume:
+
+1. `ENGAGEMENT_SYSTEM_PROMPT`'s behavioral/affective **0 and 1 anchors** are
+   written around a student who can leave ("ends the conversation", "signals
+   wanting to stop"). OSIM never leaves, so those anchors may be unreachable
+   and the realized scale compresses to 2-4. That interacts with
+   `reward.engagement_weight`, which is NOT rescaled under
+   `scale_rewards: False`.
+2. Both prompts' ROLE CHECK / ROLE RULE describe assistant-drift in UserLM's
+   idioms. OSIM drifts differently (and now occupies the `assistant` slot,
+   which may make drift likelier), so the wording and the
+   `looks_like_assistant` regex both need re-deriving from real OSIM drift
+   samples.
+
+## Eval-time Δ solve rate: use the NEUTRAL prompts, not the personas
+
+`prompt_templates/student_initial_attempt_prompt.txt` and
+`student_final_prompt.txt` (TutorRL verbatim, item 8 above) stay exactly as
+they are -- just pointed at OSIM instead of Llama-3.1-8B. This removes the
+probe/simulator mismatch, since the student being tutored and the student being
+tested become the same model.
+
+**Deliberately out of persona.** The passive persona declines the probe 15.6%
+of the time, and refusals score as wrong, which would conflate "cannot solve"
+with "would not attempt" (measured in `logs/osim_solve_probe_v2.json`).
+
+## Files that are NOT part of training or eval
+
+Written as measurement instruments only; do not wire these into a run:
+
+- `prompt_templates/osim_initial_attempt_prompt.txt`
+- `prompt_templates/osim_final_solution_prompt.txt`
+
+These are the *in-persona* versions of the probe. Their only purpose was to
+measure what happens when the solve request arrives as a tutor turn inside the
+persona -- which is what produced the 15.6% refusal finding that justified
+using the neutral prompts instead.
+
+- `prompt_templates/personas/osim_engaged.txt` -- the second training arm
+  (persona is fixed within a run and varied across runs; never varied within a
+  GRPO group, or it becomes an unobserved confounder inflating within-group
+  variance with zero tutor signal). Not used until the passive run is done.
+- `prompt_templates/personas/simple_student.txt` -- TutorRL's always-engaged
+  baseline student. Unrelated to OSIM.

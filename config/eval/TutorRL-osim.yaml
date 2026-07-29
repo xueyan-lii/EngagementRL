@@ -1,9 +1,12 @@
-# Baseline: TutorRL-7B x UserLM-8b (disengaging student), matched to
-# full_baseline_2x2.sh CELL 1 -- the script that produced the paper's Table 4
-# numbers. gpu_ids / engagement_model / forced_conversation_type=guided /
-# use_v0=false / enforce_eager=true / load_and_unload=false were all set as
-# CLI overrides by that script and are pinned here instead so this config is
-# runnable standalone through run_eval_engagement.sh.
+# Baseline: TutorRL-7B x OSIM (OdysSim student). The controlled pair to
+# config/eval/TutorRL.yaml -- every model, prompt, dataset and metric is
+# identical; the ONLY changed variable is the in-dialogue student simulator
+# (microsoft/UserLM-8b -> cmu-lti/osim-8b).
+#
+# Note on the disengagement metric: OSIM has no end-of-conversation token, so
+# disengagement is detected from an explicit textual sign-off. That proxy is
+# conservative and UNCALIBRATED -- it is not comparable to UserLM's p_end, and
+# a low rate here reflects the simulator, not the tutor.
 teacher_model:
   model_name_or_path: eth-nlped/TutorRL-7B
   use_openrouter: false
@@ -18,6 +21,8 @@ teacher_model:
     enforce_eager: true
     load_and_unload: false
 
+# Knowledge probe: unchanged from the UserLM baseline so Delta Solve Rate is
+# measured on the same instrument across both arms.
 student_model:
   model_name_or_path: NousResearch/Meta-Llama-3.1-8B-Instruct
   vllm:
@@ -26,7 +31,7 @@ student_model:
     max_num_seqs: 512
     gpu_memory_utilization: 0.85
     number_of_gpus_per_instance: 1
-    gpu_ids: [1]
+    gpu_ids: [2]
     use_v0: false
     enforce_eager: true
     load_and_unload: false
@@ -39,13 +44,13 @@ judge_model:
     max_num_seqs: 512
     gpu_memory_utilization: 0.85
     number_of_gpus_per_instance: 1
-    gpu_ids: [2]
+    gpu_ids: [3]
     use_v0: false
     enforce_eager: true
     load_and_unload: false
 
 engagement_model:
-  model_name_or_path: microsoft/UserLM-8b
+  model_name_or_path: cmu-lti/osim-8b
   vllm:
     temperature: 1.0
     top_p: 0.8
@@ -53,13 +58,16 @@ engagement_model:
     max_num_seqs: 64
     gpu_memory_utilization: 0.85
     number_of_gpus_per_instance: 1
-    gpu_ids: [3]
+    gpu_ids: [5]
     use_v0: false
     enforce_eager: true
     load_and_unload: false
 
 reward_model:
   model_name_or_path: "Answer"
+
+simulator: osim
+persona_path: prompt_templates/personas/osim_passive.txt
 
 generation:
   forced_conversation_type: guided
@@ -71,6 +79,6 @@ score_using_pedagogical_reward: false
 logging:
   wandb: false
   wandb_project: eval
-  wandb_run_name: TutorRL-7B-UserLM
+  wandb_run_name: TutorRL-7B-OSIM
   run_group: tutor
-  wandb_tags: ["tutor", "7b", "userlm"]
+  wandb_tags: ["tutor", "7b", "osim"]

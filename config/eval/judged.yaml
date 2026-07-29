@@ -1,0 +1,84 @@
+# Judge-only eval: dialogue-level engagement + learning, no solve-rate probe
+# and no sibling transfer test. Override teacher_model / simulator /
+# persona_path / engagement_model per cell (see run_judged_sweep.sh).
+#
+# Three models load: teacher (GPU 0), simulator (GPU 1), judge (GPU 2). The
+# knowledge probe is skipped entirely via generation.skip_student_model.
+teacher_model:
+  model_name_or_path: Qwen/Qwen3-8B      # overridden per cell
+  use_openrouter: false
+  vllm:
+    temperature: 0.6
+    max_length: 12000
+    max_num_seqs: 512
+    gpu_memory_utilization: 0.85
+    number_of_gpus_per_instance: 1
+    gpu_ids: [0]
+    use_v0: false
+    enforce_eager: true
+    load_and_unload: false
+
+# Never loaded (generation.skip_student_model=true) -- the field must still be
+# present because Classroom's constructor reads the config object.
+student_model:
+  model_name_or_path: NousResearch/Meta-Llama-3.1-8B-Instruct
+  vllm:
+    gpu_ids: [0]
+    use_v0: false
+    enforce_eager: true
+    load_and_unload: false
+
+engagement_model:
+  model_name_or_path: microsoft/UserLM-8b   # overridden per cell
+  vllm:
+    temperature: 1.0
+    top_p: 0.8
+    max_length: 8192
+    max_num_seqs: 64
+    gpu_memory_utilization: 0.85
+    number_of_gpus_per_instance: 1
+    gpu_ids: [1]
+    use_v0: false
+    enforce_eager: true
+    load_and_unload: false
+
+judge_model:
+  model_name_or_path: Qwen/Qwen3.6-27B
+  vllm:
+    temperature: 0.6
+    max_length: 16384
+    max_num_seqs: 64
+    gpu_memory_utilization: 0.85
+    number_of_gpus_per_instance: 1
+    gpu_ids: [2]
+    use_v0: false
+    enforce_eager: true
+    load_and_unload: false
+
+reward_model:
+  model_name_or_path: "Answer"
+
+simulator: userlm
+persona_path: prompt_templates/personas/osim_passive.txt
+run_name: judged
+out_dir: logs/judged
+
+num_samples_per_problem: 1
+
+dataset:
+  max_val_examples: 200
+
+generation:
+  forced_conversation_type: guided
+  use_thinking: false          # match the teacher checkpoint being evaluated
+  max_turns: 15
+  max_tokens_per_turn: 512
+  max_tokens_in_conversation: 4500
+  max_tokens_per_judge_attempt: 2048
+  number_judge_attempts: 0     # no binary leak/pedagogy judges on this path
+  skip_student_model: true     # no pre/post solve rate -> probe never loaded
+
+score_using_pedagogical_reward: false
+
+logging:
+  wandb: false

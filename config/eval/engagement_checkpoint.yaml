@@ -1,7 +1,7 @@
 # Eval config for our engagement-conditioned GRPO checkpoints, using the same
 # protocol/models as the TutorRL x UserLM baseline (paper Appendix "Baseline:
 # TutorRL under a Disengaging Student"): Llama-3.1-8B knowledge probe,
-# gemma-3-27b-it leak/pedagogy judge, UserLM-8b engagement simulator.
+# Qwen3.6-27B leak/pedagogy judge, UserLM-8b engagement simulator.
 # teacher_model.model_name_or_path is a placeholder -- always override it per
 # job (see run_eval_engagement.sh), since this config is shared across
 # checkpoints.
@@ -41,7 +41,7 @@ student_model:
     load_and_unload: false
 
 judge_model:
-  model_name_or_path: google/gemma-3-27b-it
+  model_name_or_path: Qwen/Qwen3.6-27B
   vllm:
     temperature: 0.6
     max_length: 12000

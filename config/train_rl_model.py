@@ -102,6 +102,9 @@ class GenerationConfig:
     max_tokens_per_turn: int = 1024
     max_tokens_per_student_attempt: int = 3900  # A small buffer for the reward model.
     max_tokens_per_judge_attempt: int = 2048
+    # Skip loading the knowledge-probe student model entirely. Only valid for
+    # evals that never compute pre/post solve rate (see eval_judged.py).
+    skip_student_model: bool = False
     tokenizer_to_use: str = "Qwen/Qwen2.5-7B-Instruct"
 
     # Number of attempts we will average over the final student generation.

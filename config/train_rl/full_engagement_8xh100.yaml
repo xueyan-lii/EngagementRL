@@ -124,7 +124,8 @@ judge_model:
 reward:
   engagement_weight: 0.5
   learning_weight: 1.0
-  leak_multiplier: 0.0   # judge flags tutor_leaked -> learning reward x this
+  leak_multiplier: 1.0   # 1.0 = gate off; EVIDENCE RULE in the learning rubric
+                         # already penalises leakage. Rate still logged.
 
 dataset:
   max_train_examples: -1   # full Big-Math train split, shuffled (seed 42)

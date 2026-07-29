@@ -13,7 +13,13 @@ from hydra.core.config_store import ConfigStore
 from dotenv import load_dotenv
 
 from engagement_classroom import EngagementClassroom
+from osim_classroom import OsimEngagementClassroom
 from src.classroom import JudgeDecision
+from judge_rewards import (
+    engagement_scalar,
+    judge_dialogues,
+    learning_scalar,
+)
 from utils.data import load_datasets
 from utils.transfer_test import load_sibling_pool, select_siblings
 from config.eval import EvalConfig
@@ -33,6 +39,12 @@ class EngagementEvalConfig(EvalConfig):
             model_name_or_path="microsoft/UserLM-8b"
         )
     )
+    # Which simulator drives the in-dialogue student: "userlm" or "osim".
+    # Only the classroom changes -- teacher, knowledge probe, judge, dataset
+    # and metrics are identical, so the two are a controlled pair.
+    simulator: str = "userlm"
+    # OSIM only: persona in the system slot (see PROMPTS.md, design A).
+    persona_path: str = "prompt_templates/personas/osim_passive.txt"
 
 
 cs = ConfigStore.instance()
@@ -65,15 +77,32 @@ def _macro_mean_list(values, n_problems, n_samples):
 def main(cfg):
     cfg = OmegaConf.merge(OmegaConf.structured(EngagementEvalConfig), cfg)
 
-    classroom = EngagementClassroom(
-        cfg.student_model,
-        cfg.teacher_model,
-        cfg.judge_model,
-        cfg.reward_model,
-        cfg.generation,
-        None,
-        cfg.engagement_model,
-    )
+    if cfg.simulator == "osim":
+        logger.info(f"Engagement simulator: OSIM (persona {cfg.persona_path})")
+        classroom = OsimEngagementClassroom(
+            cfg.student_model,
+            cfg.teacher_model,
+            cfg.judge_model,
+            cfg.reward_model,
+            cfg.generation,
+            None,
+            cfg.engagement_model,
+            persona_path=cfg.persona_path,
+        )
+    elif cfg.simulator == "userlm":
+        classroom = EngagementClassroom(
+            cfg.student_model,
+            cfg.teacher_model,
+            cfg.judge_model,
+            cfg.reward_model,
+            cfg.generation,
+            None,
+            cfg.engagement_model,
+        )
+    else:
+        raise ValueError(
+            f"Unknown simulator {cfg.simulator!r}; expected 'userlm' or 'osim'"
+        )
 
     _, eval_data = load_datasets(cfg.dataset, cfg.seed)
     # Capture domain/difficulty metadata before eval_data gets sliced down to
@@ -158,6 +187,40 @@ def main(cfg):
         sum(disengage_turns) / len(disengage_turns) if disengage_turns else float("nan")
     )
 
+    # ---- LM-judged dialogue-level engagement + learning ----
+    # Same rubrics as the training reward (judge_rewards.py), so eval numbers
+    # are directly interpretable against what GRPO optimised. Reported per
+    # DIALOGUE: the engagement rubric rates individual student turns, but only
+    # its aggregate is a metric. Normalised by max student turns (max_turns//2)
+    # rather than by turns taken, matching engagement_scalar's training use --
+    # otherwise a one-turn dialogue and a full-length one score identically.
+    # NOTE: this judge is the eval judge (see config), not the training judge,
+    # so absolute values are not comparable across the two pipelines.
+    logger.info("Scoring dialogues with the training rubrics (engagement + learning)...")
+    max_student_turns = max(1, cfg.generation.max_turns // 2)
+
+    def _judge_run_batch(messages):
+        responses = classroom.judge_model.run_batch(
+            messages, classroom.sampling_params_judge
+        )
+        return [r.outputs[0].text for r in responses]
+
+    dialogues = [c._get_hidden_conversation() for c in conversations]
+    turn_scores, learning_scores = judge_dialogues(
+        _judge_run_batch, dialogues, sample_problems, sample_answers
+    )
+    eng_vals = [engagement_scalar(ts, max_student_turns) for ts in turn_scores]
+    learn_vals = [learning_scalar(ls) for ls in learning_scores]
+    judged_engagement = _macro_mean_list(eng_vals, n_problems, n_samples)
+    judged_learning = _macro_mean_list(learn_vals, n_problems, n_samples)
+
+    def _dim_mean(scores_list, dim, skip_negative=False):
+        vals = [s[dim] for s in scores_list
+                if not (skip_negative and s[dim] < 0)]
+        return sum(vals) / len(vals) if vals else float("nan")
+
+    flat_turns = [t for ts in turn_scores for t in ts if not t.get("role_drift")]
+
     print("\n================ ENGAGEMENT BASELINE RESULTS ================", flush=True)
     print(f"Problems x samples         : {n_problems} x {n_samples}", flush=True)
     print(f"Pre-dialog solve rate      : {initial:.4f}", flush=True)
@@ -180,6 +243,21 @@ def main(cfg):
     print(f"Avg dialog length (msgs)   : {avg_turns:.2f}", flush=True)
     print(f"Avg turns-to-disengagement : {avg_disengage_turn:.2f}", flush=True)
 
+    print("--- LM-judged (same rubrics as training reward) ---", flush=True)
+    print(f"Engagement (dialogue, /max turns)           : {judged_engagement:.4f}", flush=True)
+    print(f"Learning   (dialogue, 4-dim rubric)         : {judged_learning:.4f}", flush=True)
+    if flat_turns:
+        print(f"  engagement dims  behavioral {_dim_mean(flat_turns,'behavioral'):.2f}"
+              f" / affective {_dim_mean(flat_turns,'affective'):.2f}"
+              f" / cognitive {_dim_mean(flat_turns,'cognitive'):.2f}"
+              f" / learning_evidence {_dim_mean(flat_turns,'learning_evidence'):.2f}"
+              f"   (n={len(flat_turns)} student turns)", flush=True)
+    print(f"  learning dims    progress {_dim_mean(learning_scores,'solution_progress'):.2f}"
+          f" / understanding {_dim_mean(learning_scores,'understanding'):.2f}"
+          f" / misconception {_dim_mean(learning_scores,'misconception_repair', True):.2f}"
+          f" / independence {_dim_mean(learning_scores,'independence'):.2f}", flush=True)
+    print(f"  tutor_leaked flag rate (appendix)          : "
+          f"{sum(s.get('tutor_leaked', False) for s in learning_scores)/len(learning_scores):.4f}", flush=True)
     print("--- Transfer test (sibling problem, same domain/difficulty) ---", flush=True)
     print(f"Sibling solve rate (cold, no dialogue)      : {transfer_control:.4f}", flush=True)
     print(f"Sibling solve rate (after dialogue, in-ctx) : {transfer_treatment:.4f}", flush=True)

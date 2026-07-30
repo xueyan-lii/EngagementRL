@@ -6,3 +6,7 @@ __pycache__
 checkpoints
 logs/
 data/
+# ...but ship the OSIM-calibrated OpenR1 splits: 27MB total, and rebuilding
+# them elsewhere needs ~3h of GPU scoring (utils/build_osim_dataset.py).
+!data/openr1_osim/
+!data/openr1_osim_incl0/

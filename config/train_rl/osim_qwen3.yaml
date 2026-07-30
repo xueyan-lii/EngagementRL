@@ -46,6 +46,10 @@ train:
   gradient_checkpointing: true
   save_policy_to_disk_every_n: 1
   batch_size_ref_model: 1
+  # Credit each teacher turn with the student turn it elicited, rather than
+  # broadcasting one trajectory-level advantage across every token.
+  per_turn_rewards: true
+  per_turn_min_group: 4
 
 teacher_model:
   model_name_or_path: Qwen/Qwen3-8B
@@ -105,6 +109,9 @@ reward:
   # ~70% of dialogues past one turn and was anti-correlated with engagement.
   # More load-bearing here than before, since the tutor now holds the solution.
   leak_multiplier: 1.0
+  # Weight on the terminal 4-dim rubric, added as a constant to every turn in
+  # the per-turn path (unused by the trajectory path).
+  terminal_weight: 1.0
 
 dataset:
   max_train_examples: -1

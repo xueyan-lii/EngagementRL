@@ -536,9 +536,23 @@ class ClassroomGRPOTrainer(Trainer):
         out = torch.zeros(
             turn_ids.shape, dtype=torch.float32, device=completion_ids.device
         )
+        n_mismatch = n_empty = 0
+        worst = None
         for b, advs in enumerate(adv_lists):
+            # The server returns one reward per STUDENT turn; the trainer counts
+            # teacher turns in the tokenised completion. They must line up or
+            # advantages land on the wrong turn -- silently, since the clamp
+            # below keeps indexing legal. Mismatches happen when a dialogue is
+            # cut by max_tokens_in_conversation, or on drift truncation.
+            n_turns = int(turn_ids[b].max().item()) + 1 if (turn_ids[b] >= 0).any() else 0
             if not advs:
+                if n_turns:
+                    n_empty += 1
                 continue
+            if len(advs) != n_turns:
+                n_mismatch += 1
+                if worst is None or abs(len(advs) - n_turns) > abs(worst[0] - worst[1]):
+                    worst = (len(advs), n_turns)
             a = torch.tensor(advs, dtype=torch.float32, device=out.device)
             tb = turn_ids[b]
             valid = tb >= 0
@@ -546,6 +560,17 @@ class ClassroomGRPOTrainer(Trainer):
             # to the last available value rather than indexing out of range.
             idx = tb.clamp(min=0, max=len(advs) - 1)
             out[b] = torch.where(valid, a[idx], torch.zeros_like(out[b]))
+        if n_mismatch or n_empty:
+            logger.warning(
+                "PER-TURN REWARD MISALIGNMENT: %d/%d dialogues have a different "
+                "number of per-turn rewards than teacher turns in the tokenised "
+                "completion (worst: %s rewards vs %s turns); %d have turns but no "
+                "rewards. Advantages for the surplus turns are clamped to the last "
+                "available value, so credit lands on the wrong turn. Usually means "
+                "a dialogue was cut by generation.max_tokens_in_conversation.",
+                n_mismatch, len(adv_lists),
+                worst[0] if worst else "-", worst[1] if worst else "-", n_empty,
+            )
         return out
 
     def _compute_assistant_turn_ids(self, input_ids):

@@ -25,6 +25,7 @@ from pydantic import BaseModel
 from config.train_rl_engagement_model import TrainEngagementRLConfig
 from train_engagement_classroom import TrainEngagementClassroom
 from train_osim_classroom import TrainOsimClassroom
+from judge_rewards import learning_scalar
 from src.classroom import Conversation
 from src.utils.utils import init_logger
 
@@ -68,6 +69,18 @@ def sample_conversations(request: ConversationSampleRequest):
 
     eng = [classroom.get_engagement_reward(c) for c in conversations]
     lea = [classroom.get_learning_reward(c) for c in conversations]
+    # The three reward COMPONENTS, logged separately: with per-turn credit
+    # assignment the trainer builds advantages directly and TRL's
+    # rewards/<func> metrics no longer describe what is being optimised.
+    def _mean(xs):
+        return sum(xs) / len(xs) if xs else 0.0
+    pt_eng, pt_evid = [], []
+    for c in conversations:
+        kept = [t for t in c.turn_scores if not t.get("role_drift", False)]
+        pt_eng.append(_mean([(t["behavioral"] + t["affective"] + t["cognitive"]) / 12.0
+                             for t in kept]))
+        pt_evid.append(_mean([t.get("learning_evidence", 0) / 4.0 for t in kept]))
+    term = [learning_scalar(getattr(c, "learning_scores", None)) for c in conversations]
     dis = [c.disengaged for c in conversations]
     drift_trunc = sum(c.role_drifted for c in conversations)
     drift_resamples = sum(c.drift_resamples for c in conversations)
@@ -120,7 +133,9 @@ def sample_conversations(request: ConversationSampleRequest):
         f"learning mean {sum(lea)/len(lea):.3f}, "
         f"disengaged {sum(dis)}/{len(dis)}, "
         f"drift: {drift_resamples} resamples, {drift_trunc} truncated, "
-        f"{judge_drift} judge-flagged turns, leaked {leaked}/{len(conversations)}"
+        f"{judge_drift} judge-flagged turns, leaked {leaked}/{len(conversations)} | "
+        f"components: per-turn eng {_mean(pt_eng):.3f}, "
+        f"per-turn evidence {_mean(pt_evid):.3f}, terminal {_mean(term):.3f}"
     )
 
     if config.logging.wandb:
@@ -137,6 +152,9 @@ def sample_conversations(request: ConversationSampleRequest):
                 "server/drift_resamples": drift_resamples,
                 "server/judge_flagged_drift_turns": judge_drift,
                 "server/leak_rate": leaked / len(conversations),
+                "server/per_turn_engagement_mean": _mean(pt_eng),
+                "server/per_turn_learning_evidence_mean": _mean(pt_evid),
+                "server/terminal_rubric_mean": _mean(term),
             }
         )
 
@@ -159,6 +177,18 @@ def get_learning_reward(request: RewardRequest):
         classroom.get_conversation_by_text(c) for c in request.conversations
     ]
     return [classroom.get_learning_reward(c) for c in conversations]
+
+
+@app.post("/get_per_turn_rewards")
+def get_per_turn_rewards(request: RewardRequest):
+    """Per-student-turn rewards, aligned with each dialogue's student turns.
+    Returns a ragged list-of-lists; the trainer maps entry t onto the tokens of
+    teacher turn t."""
+    global classroom
+    conversations: list[Conversation] = [
+        classroom.get_conversation_by_text(c) for c in request.conversations
+    ]
+    return [classroom.get_per_turn_rewards(c) for c in conversations]
 
 
 @app.get("/wait_batch")
@@ -197,6 +227,9 @@ def main(cfg: TrainEngagementRLConfig):
         generation_cfg=cfg.generation,
         model_save_path=os.path.join(cfg.logging.save_dir, "policy"),
         leak_multiplier=cfg.reward.leak_multiplier,
+        learning_weight=cfg.reward.learning_weight,
+        engagement_weight=cfg.reward.engagement_weight,
+        terminal_weight=cfg.reward.terminal_weight,
     )
     if simulator == "osim":
         logger.info(f"Simulator: OSIM (persona {cfg.persona_path})")

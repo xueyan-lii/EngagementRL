@@ -37,6 +37,12 @@ class ModelvLLMConfig:
     use_v0: bool = True
     enforce_eager: bool = False
 
+    # Extra kwargs for chat-template rendering, e.g. {"enable_thinking": false}
+    # for hybrid-reasoning models. Qwen3-8B defaults to thinking ON, which --
+    # on top of the teacher prompt's own <think> instruction -- consumed the
+    # 512-token turn budget and truncated 24% of teacher turns mid-thought.
+    chat_template_kwargs: Optional[Dict[str, Any]] = None
+
 
 @dataclass
 class TeacherModelConfig:
@@ -153,6 +159,10 @@ class DatasetConfig:
 
 @dataclass
 class TrainConfig:
+    # Credit each teacher turn with the student turn it elicited, instead of
+    # broadcasting one trajectory-level advantage across every token.
+    per_turn_rewards: bool = False
+    per_turn_min_group: int = 4
     gradient_checkpointing: bool = True
 
     num_samples_per_problem: int = 8

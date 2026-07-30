@@ -15,6 +15,24 @@ class ClassroomGRPOConfig(TrainingArguments):
     else:
         _VALID_DICT_FIELDS = TrainingArguments._VALID_DICT_FIELDS + ["model_init_kwargs"]
 
+    # Per-turn credit assignment: build a (B, T) advantage tensor crediting each
+    # teacher turn with the student turn it elicited, instead of broadcasting one
+    # trajectory-level advantage to every token. Off = original GRPO behaviour.
+    per_turn_rewards: bool = field(default=False)
+    # Minimum group members that must reach a turn index before its per-turn
+    # baseline is trusted; below this, fall back to the trajectory advantage.
+    per_turn_min_group: int = field(default=4)
+
+    # Upload full prompt/completion transcripts to wandb as a per-step Table.
+    # OFF by default: the server already dumps every rollout locally to
+    # <save_dir>/dialogues/batch_NNNN.jsonl, and uploading the same text
+    # exhausted a 5GB wandb storage quota over one 200-step run.
+    log_completions_to_wandb: bool = field(
+        default=False,
+        metadata={"help": "Log rollout transcripts to wandb (large; local dumps "
+                          "in <save_dir>/dialogues/ are the source of truth)."},
+    )
+
     # Parameters that control the model and reference model
     model_init_kwargs: Optional[Union[dict, str]] = field(
         default=None,

@@ -402,3 +402,47 @@ def judge_dialogues(run_batch, dialogues, problems, answers):
     learning_scores = _batch(learn_messages, extract_learning_scores,
                              DEFAULT_LEARNING_SCORES)
     return turn_scores, learning_scores
+
+
+# ---------------------------------------------------------------------------
+# Per-turn rewards (dense credit assignment)
+# ---------------------------------------------------------------------------
+
+def per_turn_rewards(turn_scores, learning_scores=None, learning_weight=1.0,
+                     engagement_weight=0.5, terminal_weight=1.0):
+    """One reward per STUDENT turn, for per-turn credit assignment.
+
+        r_t = w_L * learning_evidence_t/4 + w_E * (beh+aff+cog)_t/12
+        G_t = r_t + w_T * learning_scalar(terminal)
+
+    Both components are normalised to [0,1] before weighting (learning_evidence
+    is a 0-4 anchored scale; the three engagement dims are 0-4 each), so w_L and
+    w_E keep the meaning they have in the trajectory-level path.
+
+    Teacher turn t is credited with the STUDENT turn it elicited -- turn_scores
+    is positionally aligned with the student turns, and the trainer maps each
+    teacher turn to the same index.
+
+    The terminal 4-dim rubric is added as a CONSTANT to every turn rather than
+    folded into the last one. It measures things no single turn can express
+    (`independence` is explicitly a trajectory; `misconception_repair` is
+    cross-turn), and because it is identical across a dialogue's turns it
+    survives the per-turn-index group baseline only as variation BETWEEN group
+    members -- exactly the trajectory-level signal wanted, without disturbing
+    the within-dialogue ordering that the per-turn terms provide.
+
+    Drift-flagged turns get 0.0 so they neither reward nor penalise, matching
+    engagement_scalar's treatment.
+
+    Returns a list of floats, one per entry in turn_scores.
+    """
+    terminal = terminal_weight * learning_scalar(learning_scores) if learning_scores else 0.0
+    out = []
+    for t in turn_scores:
+        if t.get("role_drift", False):
+            out.append(0.0)
+            continue
+        eng = (t["behavioral"] + t["affective"] + t["cognitive"]) / 12.0
+        learn = t.get("learning_evidence", 0) / 4.0
+        out.append(learning_weight * learn + engagement_weight * eng + terminal)
+    return out

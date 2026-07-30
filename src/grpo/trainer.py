@@ -495,6 +495,88 @@ class ClassroomGRPOTrainer(Trainer):
     ####################################################################################
     # Mask user turns, used for multi-turn RL Training
     ####################################################################################
+    def _per_turn_advantage_lists(self, ragged_rewards, fallback_advantages):
+        """Baseline each turn against the SAME turn index across its GRPO group.
+
+        ragged_rewards: list (len B_gathered) of per-student-turn reward lists.
+        Returns a list of per-turn ADVANTAGE lists, same ragged shape.
+
+        Dialogues in a group end at different turns, so late indices may have
+        only one or two members to baseline against. Below `min_group_at_index`
+        members the baseline is meaningless (with one member the advantage is
+        identically 0, silently killing the gradient on late turns), so those
+        fall back to the trajectory-level advantage for that sample.
+        """
+        min_members = getattr(self.args, "per_turn_min_group", 4)
+        G = self.num_generations
+        out = [list(r) for r in ragged_rewards]
+        for g0 in range(0, len(out), G):
+            group = out[g0:g0 + G]
+            if not group:
+                continue
+            max_turns = max((len(r) for r in group), default=0)
+            for t in range(max_turns):
+                vals = [r[t] for r in group if len(r) > t]
+                if len(vals) >= min_members:
+                    m = sum(vals) / len(vals)
+                    for j, r in enumerate(group):
+                        if len(r) > t:
+                            r[t] = r[t] - m
+                else:
+                    for j, r in enumerate(group):
+                        if len(r) > t:
+                            r[t] = float(fallback_advantages[g0 + j])
+        return out
+
+    def _scatter_per_turn_advantages(self, completion_ids, adv_lists):
+        """Scatter per-turn advantages onto tokens -> (B, T) float tensor.
+        Tokens outside an assistant turn get 0; they are masked out of the loss
+        by assistant_mask anyway, so the value is irrelevant."""
+        turn_ids = self._compute_assistant_turn_ids(completion_ids)
+        out = torch.zeros(
+            turn_ids.shape, dtype=torch.float32, device=completion_ids.device
+        )
+        for b, advs in enumerate(adv_lists):
+            if not advs:
+                continue
+            a = torch.tensor(advs, dtype=torch.float32, device=out.device)
+            tb = turn_ids[b]
+            valid = tb >= 0
+            # Turns beyond the reward list (e.g. a truncated final turn) clamp
+            # to the last available value rather than indexing out of range.
+            idx = tb.clamp(min=0, max=len(advs) - 1)
+            out[b] = torch.where(valid, a[idx], torch.zeros_like(out[b]))
+        return out
+
+    def _compute_assistant_turn_ids(self, input_ids):
+        """Per-token index of the assistant (teacher) TURN a token belongs to.
+
+        Same sequence walk as _compute_assistant_mask, but instead of 0/1 it
+        emits 0,1,2,... for successive assistant messages and -1 for everything
+        else. Used to scatter per-turn advantages onto tokens: entry t of the
+        server's per-turn reward list maps onto the tokens of teacher turn t.
+
+        Derived from the mask rather than re-implementing the tokenizer walk:
+        a token starts a new turn when the mask goes 0 -> 1.
+        """
+        mask = self._compute_assistant_mask(input_ids)
+        if mask.dim() == 1:
+            mask = mask.unsqueeze(0)
+            squeeze = True
+        else:
+            squeeze = False
+        turn_ids = torch.full_like(mask, -1, dtype=torch.long)
+        for b in range(mask.shape[0]):
+            cur, prev = -1, 0
+            for i in range(mask.shape[1]):
+                m = int(mask[b, i])
+                if m == 1:
+                    if prev == 0:
+                        cur += 1
+                    turn_ids[b, i] = cur
+                prev = m
+        return turn_ids.squeeze(0) if squeeze else turn_ids
+
     def _compute_assistant_mask(self, input_ids):
 
         if "llama" in self.model_name_or_path.lower():
@@ -1044,12 +1126,36 @@ class ClassroomGRPOTrainer(Trainer):
         if self.args.scale_rewards:
             advantages = advantages / (std_grouped_rewards + 1e-4)
 
+        # ---- per-turn credit assignment -------------------------------------
+        # The trajectory path above broadcasts ONE advantage to every teacher
+        # token across all turns, so a good turn and a useless one in the same
+        # dialogue get identical credit. When enabled, replace that with a
+        # (B, T) tensor: each teacher turn is credited with the student turn it
+        # elicited, baselined against the SAME turn index in its GRPO group.
+        per_turn_ragged = None
+        if getattr(self.args, "per_turn_rewards", False) and getattr(
+            self, "per_turn_reward_fn", None
+        ) is not None:
+            # Ragged per-turn rewards for the GATHERED batch, so the group
+            # baseline sees all num_generations members of each group.
+            per_turn_ragged = self._per_turn_advantage_lists(
+                self.per_turn_reward_fn(all_completions_text), advantages
+            )
+
         # Slice to keep only the local part of the data
         process_slice = slice(
             self.accelerator.process_index * len(prompts),
             (self.accelerator.process_index + 1) * len(prompts),
         )
         advantages = advantages[process_slice]
+        # Slice the ragged advantage lists to this process, then scatter onto
+        # LOCAL completion_ids so the (B, T) tensor matches the loss's shapes
+        # (gathered ids may be padded to a different length).
+        per_turn_advantages = None
+        if per_turn_ragged is not None:
+            per_turn_advantages = self._scatter_per_turn_advantages(
+                completion_ids, per_turn_ragged[process_slice]
+            )
 
         # Log the metrics
         mode = "eval" if self.control.should_evaluate else "train"
@@ -1077,8 +1183,14 @@ class ClassroomGRPOTrainer(Trainer):
         self._metrics[mode]["reward"].append(rewards.mean().item())
         self._metrics[mode]["reward_std"].append(std_grouped_rewards.mean().item())
 
+        # Full rollout transcripts are dumped LOCALLY every batch by the server
+        # (<save_dir>/dialogues/batch_NNNN.jsonl). Uploading the same text to
+        # wandb as a per-step Table costs ~48 dialogues x every logging step and
+        # exhausted the account's 5GB storage quota on a 200-step run, so this
+        # is off unless explicitly enabled.
         if (
-            self.state.global_step % self.args.logging_steps == 0
+            getattr(self.args, "log_completions_to_wandb", False)
+            and self.state.global_step % self.args.logging_steps == 0
             and "wandb" in self.args.report_to
         ):
             import pandas as pd
@@ -1102,6 +1214,7 @@ class ClassroomGRPOTrainer(Trainer):
             "completion_ids": completion_ids,
             "completion_mask": completion_mask,
             "advantages": advantages,
+            "per_turn_advantages": per_turn_advantages,
             "old_per_token_logps": old_per_token_logps,
             "ref_per_token_logps": ref_per_token_logps,
         }
@@ -1151,8 +1264,14 @@ class ClassroomGRPOTrainer(Trainer):
         )
         coef_1 = torch.exp(per_token_logps - old_per_token_logps)
         coef_2 = torch.clamp(coef_1, 1 - self.epsilon, 1 + self.epsilon)
-        per_token_loss1 = coef_1 * advantages.unsqueeze(1)
-        per_token_loss2 = coef_2 * advantages.unsqueeze(1)
+        # (B, T) when per-turn credit assignment is on, else broadcast (B, 1).
+        pta = inputs.get("per_turn_advantages")
+        if pta is not None:
+            adv = pta[:, 1:]  # completion_mask was shifted by one above
+        else:
+            adv = advantages.unsqueeze(1)
+        per_token_loss1 = coef_1 * adv
+        per_token_loss2 = coef_2 * adv
         per_token_loss = -torch.min(per_token_loss1, per_token_loss2)
         if self.beta != 0.0:
             per_token_loss = per_token_loss + self.beta * per_token_kl

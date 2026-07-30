@@ -15,6 +15,11 @@ class EngagementRewardConfig:
     learning_weight: float = 1.0
     # Multiplier applied to the learning reward when the terminal judge flags
     # tutor leakage (tutor_leaked). 0.0 = leaking forfeits all learning credit.
+    # Weight on the terminal 4-dim rubric in the per-turn reward. Added as a
+    # constant to every turn, so it acts as a trajectory-level signal that
+    # survives the per-turn-index baseline only as variation between group
+    # members. Unused by the trajectory-level path.
+    terminal_weight: float = 1.0
     # 1.0 = gate OFF. Leakage is no longer a headline metric (it is TutorRL's
     # focus, not ours), and the terminal learning rubric's EVIDENCE RULE already
     # penalises tutor-stated answers per-dimension. The multiplicative gate on

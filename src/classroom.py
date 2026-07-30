@@ -307,9 +307,14 @@ class Conversation:
 
     def _hide_thinking(self, content: str):
         # We remove everything between <think> and </think>
-        return re.sub(r"<think>.*?</think>", "", content, flags=re.S).replace(
-            "<end_of_conversation>", ""
-        )
+        content = re.sub(r"<think>.*?</think>", "", content, flags=re.S)
+        # A turn truncated at max_tokens_per_turn leaves <think> unclosed, and
+        # the pattern above (which requires a closing tag) then leaks the raw
+        # reasoning to the student AND to both judges. Measured at 24% of
+        # teacher turns with Qwen3-8B, putting the ground-truth answer in front
+        # of the student in 11% of turns. Strip an unterminated block to EOS.
+        content = re.sub(r"<think>(?!.*</think>).*\Z", "", content, flags=re.S)
+        return content.replace("<end_of_conversation>", "")
 
     def _get_hidden_conversation(self):
         conversation = []

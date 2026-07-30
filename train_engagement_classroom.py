@@ -47,6 +47,7 @@ from judge_rewards import (
     extract_engagement_scores,
     extract_learning_scores,
     learning_scalar,
+    per_turn_rewards,
 )
 import logging
 
@@ -99,6 +100,9 @@ class TrainEngagementClassroom(Classroom):
         model_save_path,
         log_file_path=None,
         leak_multiplier=0.0,
+        learning_weight=1.0,
+        engagement_weight=0.5,
+        terminal_weight=1.0,
     ):
         # NOTE: deliberately NOT calling Classroom.__init__ (no student probe /
         # reward model at train time). Only the three models below are loaded.
@@ -107,6 +111,11 @@ class TrainEngagementClassroom(Classroom):
         self.judge_model_cfg = judge_model_cfg
         self.generation_cfg = generation_cfg
         self.leak_multiplier = leak_multiplier
+        # Only used by the per-turn reward path; the trajectory-level path
+        # applies its weights inside the trainer's reward functions instead.
+        self.learning_weight = learning_weight
+        self.engagement_weight = engagement_weight
+        self.terminal_weight = terminal_weight
 
         self.teacher_model = ParallelvLLMInference(
             model_path=teacher_model_cfg.model_name_or_path,
@@ -121,6 +130,11 @@ class TrainEngagementClassroom(Classroom):
             use_v0=False,
             logging_enabled=log_file_path is not None,
             log_file_path=log_file_path,
+            chat_template_kwargs=(
+                dict(teacher_model_cfg.vllm.chat_template_kwargs)
+                if getattr(teacher_model_cfg.vllm, "chat_template_kwargs", None)
+                else None
+            ),
         )
 
         # Overridable so a different simulator (see train_osim_classroom.py)
@@ -415,6 +429,23 @@ class TrainEngagementClassroom(Classroom):
     # ------------------------------------------------------------------
     # Rewards (called by the server endpoints)
     # ------------------------------------------------------------------
+
+    def get_per_turn_rewards(self, conversation: Conversation):
+        """One reward per student turn, for per-turn credit assignment.
+
+        Note the deliberate difference from get_learning_reward: no leak gate
+        and no participation gate. Both are trajectory-level multipliers that
+        cannot be attributed to an individual turn, and the participation gate
+        is redundant here -- a dialogue with no real student turns simply has
+        no turns to reward.
+        """
+        return per_turn_rewards(
+            getattr(conversation, "turn_scores", []),
+            getattr(conversation, "learning_scores", None),
+            learning_weight=self.learning_weight,
+            engagement_weight=self.engagement_weight,
+            terminal_weight=self.terminal_weight,
+        )
 
     def get_engagement_reward(self, conversation: Conversation) -> float:
         # max_turns counts TOTAL messages (both roles) and is only checked

@@ -61,6 +61,12 @@ teacher_model:
     enable_sleep_mode: false
     use_v0: false
     enforce_eager: true
+    # Qwen3-8B is a hybrid reasoning model and defaults to thinking ON. Combined
+    # with the teacher prompt's own <think> instruction it produced ~120 tokens
+    # of reasoning per 32 tokens of visible message, hit the 512-token cap on
+    # 33% of turns, and left <think> unclosed on 24% -- leaking raw reasoning
+    # (and the answer, 11% of turns) to the student and both judges.
+    chat_template_kwargs: {enable_thinking: false}
 
 engagement_model:
   model_name_or_path: cmu-lti/osim-8b
@@ -113,7 +119,8 @@ generation:
   max_tokens_in_conversation: 4500  # caps logit memory so the ref model fits
   max_tokens_per_judge_attempt: 1500
   number_judge_attempts: 0
-  use_thinking: true
+  use_thinking: false            # teacher prompt no longer instructs <think>;
+                                 # see teacher chat_template_kwargs above
   forced_conversation_type: guided
   teacher_prompt_path: prompt_templates/teacher_prompt_with_solution.txt
   server_port: 8006
@@ -122,8 +129,8 @@ generation:
 logging:
   wandb: true
   wandb_project: engagement-rl
-  wandb_run_name: qwen3-8b-osim-passive-refsol-v1
+  wandb_run_name: qwen3-8b-osim-passive-refsol-v2-nothink
   run_group: osim
   wandb_tags: ["osim", "qwen3-8b", "refsol", "openr1"]
-  save_dir: checkpoints/osim_qwen3_v1
+  save_dir: checkpoints/osim_qwen3_v2
   save_steps: 40

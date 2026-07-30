@@ -38,6 +38,21 @@ cs = ConfigStore.instance()
 cs.store(name="config", node=TrainEngagementRLConfig)
 
 
+def construct_per_turn_reward_fn(server_port: int):
+    """Fetch ragged per-student-turn rewards for a batch of completions.
+    Weighting is applied server-side (reward.learning_weight / engagement_weight
+    / terminal_weight), unlike the trajectory path which weights here."""
+    def fn(completions):
+        response = requests.post(
+            f"http://localhost:{server_port}/get_per_turn_rewards",
+            json={"conversations": list(completions)},
+        )
+        response.raise_for_status()
+        return response.json()
+
+    return fn
+
+
 def construct_judge_reward_func(endpoint: str, server_port: int, weight: float):
     def reward_func(completions, **kwargs):
         response = requests.post(
@@ -157,6 +172,8 @@ def main(cfg: TrainEngagementRLConfig):
             # Dr.GRPO: raw advantages. std-normalization turned all-zero-reward
             # batches into amplified noise (v0 collapse at ~step 95).
             scale_rewards=False,
+            per_turn_rewards=cfg.train.per_turn_rewards,
+            per_turn_min_group=cfg.train.per_turn_min_group,
             save_policy_to_disk_every_n_steps=cfg.train.save_policy_to_disk_every_n,
         ),
         train_dataset=train_dataset,

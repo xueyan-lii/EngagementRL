@@ -41,6 +41,8 @@ from judge_rewards import (
     ENGAGEMENT_SYSTEM_PROMPT,
     LEARNING_SYSTEM_PROMPT,
     ZERO_ENGAGEMENT_SCORES,
+    ZERO_LEARNING_SCORES,
+    LEARNING_DIMS,
     build_engagement_user_prompt,
     build_learning_user_prompt,
     engagement_scalar,
@@ -102,7 +104,6 @@ class TrainEngagementClassroom(Classroom):
         leak_multiplier=0.0,
         learning_weight=1.0,
         engagement_weight=0.5,
-        terminal_weight=1.0,
     ):
         # NOTE: deliberately NOT calling Classroom.__init__ (no student probe /
         # reward model at train time). Only the three models below are loaded.
@@ -115,7 +116,7 @@ class TrainEngagementClassroom(Classroom):
         # applies its weights inside the trainer's reward functions instead.
         self.learning_weight = learning_weight
         self.engagement_weight = engagement_weight
-        self.terminal_weight = terminal_weight
+
 
         self.teacher_model = ParallelvLLMInference(
             model_path=teacher_model_cfg.model_name_or_path,
@@ -375,76 +376,70 @@ class TrainEngagementClassroom(Classroom):
         return [p if p is not None else dict(defaults) for p in parsed]
 
     def _score_conversations(self, conversations):
-        # ---- per-turn engagement (+ learning evidence) ----
-        eng_messages, slots = [], []  # slots: (conv, index into conv.turn_scores)
+        """Both rubrics are now PER STUDENT TURN, so this issues two judge
+        calls per turn instead of one per turn plus one per dialogue."""
+        eng_msgs, eng_slots = [], []
+        lrn_msgs, lrn_slots = [], []
         for conv in conversations:
             turns = conv._get_hidden_conversation()
-            conv.turn_scores = []
+            conv.turn_scores, conv.learning_turn_scores = [], []
             for i, m in enumerate(turns):
                 if m["role"] != "student":
                     continue
+                idx = len(conv.turn_scores)
                 if m["content"].strip() == "":
                     # Blank turn: all-zero by rubric, no judge call needed.
                     conv.turn_scores.append(dict(ZERO_ENGAGEMENT_SCORES))
+                    conv.learning_turn_scores.append(dict(ZERO_LEARNING_SCORES))
                     continue
-                eng_messages.append(
-                    [
-                        {"role": "system", "content": ENGAGEMENT_SYSTEM_PROMPT},
-                        {
-                            "role": "user",
-                            "content": build_engagement_user_prompt(
-                                turns[:i], m["content"]
-                            ),
-                        },
-                    ]
-                )
-                slots.append((conv, len(conv.turn_scores)))
+                eng_msgs.append([
+                    {"role": "system", "content": ENGAGEMENT_SYSTEM_PROMPT},
+                    {"role": "user", "content": build_engagement_user_prompt(
+                        turns[:i], m["content"])},
+                ])
+                lrn_msgs.append([
+                    {"role": "system", "content": LEARNING_SYSTEM_PROMPT},
+                    {"role": "user", "content": build_learning_user_prompt(
+                        conv.problem, conv.answer, turns[:i], m["content"])},
+                ])
+                eng_slots.append((conv, idx))
+                lrn_slots.append((conv, idx))
                 conv.turn_scores.append(None)
+                conv.learning_turn_scores.append(None)
 
-        results = self._judge_batch_with_retry(
-            eng_messages, extract_engagement_scores, DEFAULT_ENGAGEMENT_SCORES
-        )
-        for (conv, idx), scores in zip(slots, results):
-            conv.turn_scores[idx] = scores
+        for (conv, idx), sc in zip(eng_slots, self._judge_batch_with_retry(
+                eng_msgs, extract_engagement_scores, DEFAULT_ENGAGEMENT_SCORES)):
+            conv.turn_scores[idx] = sc
+        for (conv, idx), sc in zip(lrn_slots, self._judge_batch_with_retry(
+                lrn_msgs, extract_learning_scores, DEFAULT_LEARNING_SCORES)):
+            conv.learning_turn_scores[idx] = sc
 
-        # ---- terminal learning outcome ----
-        learn_messages = [
-            [
-                {"role": "system", "content": LEARNING_SYSTEM_PROMPT},
-                {
-                    "role": "user",
-                    "content": build_learning_user_prompt(
-                        conv.problem, conv.answer, conv._get_hidden_conversation()
-                    ),
-                },
-            ]
-            for conv in conversations
-        ]
-        results = self._judge_batch_with_retry(
-            learn_messages, extract_learning_scores, DEFAULT_LEARNING_SCORES
-        )
-        for conv, scores in zip(conversations, results):
-            conv.learning_scores = scores
+        # Dialogue-level roll-ups kept for logging/back-compat: the leak flag is
+        # now true if ANY turn flagged it, and learning_scores is the mean of
+        # the per-turn learning dims.
+        for conv in conversations:
+            lts = [x for x in conv.learning_turn_scores if x]
+            conv.learning_scores = {
+                d: (sum(x[d] for x in lts) / len(lts)) if lts else 0
+                for d in LEARNING_DIMS
+            }
+            conv.learning_scores["tutor_leaked"] = any(
+                x.get("tutor_leaked", False) for x in lts)
+
 
     # ------------------------------------------------------------------
     # Rewards (called by the server endpoints)
     # ------------------------------------------------------------------
 
     def get_per_turn_rewards(self, conversation: Conversation):
-        """One reward per student turn, for per-turn credit assignment.
-
-        Note the deliberate difference from get_learning_reward: no leak gate
-        and no participation gate. Both are trajectory-level multipliers that
-        cannot be attributed to an individual turn, and the participation gate
-        is redundant here -- a dialogue with no real student turns simply has
-        no turns to reward.
-        """
+        """One reward per student turn. No leak gate and no participation gate:
+        both are trajectory-level multipliers that cannot be attributed to a
+        single turn."""
         return per_turn_rewards(
             getattr(conversation, "turn_scores", []),
-            getattr(conversation, "learning_scores", None),
+            getattr(conversation, "learning_turn_scores", []),
             learning_weight=self.learning_weight,
             engagement_weight=self.engagement_weight,
-            terminal_weight=self.terminal_weight,
         )
 
     def get_engagement_reward(self, conversation: Conversation) -> float:

@@ -44,7 +44,7 @@ class EngagementEvalConfig(EvalConfig):
     # and metrics are identical, so the two are a controlled pair.
     simulator: str = "userlm"
     # OSIM only: persona in the system slot (see PROMPTS.md, design A).
-    persona_path: str = "prompt_templates/personas/osim_passive.txt"
+    persona_path: str = "prompt_templates/personas/osim_disengaged.txt"
 
 
 cs = ConfigStore.instance()
@@ -206,11 +206,14 @@ def main(cfg):
         return [r.outputs[0].text for r in responses]
 
     dialogues = [c._get_hidden_conversation() for c in conversations]
-    turn_scores, learning_scores = judge_dialogues(
+    turn_scores, learning_turn_scores = judge_dialogues(
         _judge_run_batch, dialogues, sample_problems, sample_answers
     )
     eng_vals = [engagement_scalar(ts, max_student_turns) for ts in turn_scores]
-    learn_vals = [learning_scalar(ls) for ls in learning_scores]
+    # Learning is scored per turn now; the dialogue value is the turn mean.
+    learn_vals = [(sum(learning_scalar(x) for x in lts) / len(lts)) if lts else 0.0
+                  for lts in learning_turn_scores]
+    learning_scores = [x for lts in learning_turn_scores for x in lts if x]
     judged_engagement = _macro_mean_list(eng_vals, n_problems, n_samples)
     judged_learning = _macro_mean_list(learn_vals, n_problems, n_samples)
 
@@ -250,12 +253,11 @@ def main(cfg):
         print(f"  engagement dims  behavioral {_dim_mean(flat_turns,'behavioral'):.2f}"
               f" / affective {_dim_mean(flat_turns,'affective'):.2f}"
               f" / cognitive {_dim_mean(flat_turns,'cognitive'):.2f}"
-              f" / learning_evidence {_dim_mean(flat_turns,'learning_evidence'):.2f}"
+
               f"   (n={len(flat_turns)} student turns)", flush=True)
     print(f"  learning dims    progress {_dim_mean(learning_scores,'solution_progress'):.2f}"
           f" / understanding {_dim_mean(learning_scores,'understanding'):.2f}"
-          f" / misconception {_dim_mean(learning_scores,'misconception_repair', True):.2f}"
-          f" / independence {_dim_mean(learning_scores,'independence'):.2f}", flush=True)
+          f" / misconception {_dim_mean(learning_scores,'misconception_repair'):.2f}", flush=True)
     print(f"  tutor_leaked flag rate (appendix)          : "
           f"{sum(s.get('tutor_leaked', False) for s in learning_scores)/len(learning_scores):.4f}", flush=True)
     print("--- Transfer test (sibling problem, same domain/difficulty) ---", flush=True)

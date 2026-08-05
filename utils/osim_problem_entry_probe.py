@@ -127,7 +127,7 @@ def main():
     ap.add_argument("--gpu-util", type=float, default=0.40,
                     help="per-model; two models share one GPU")
     ap.add_argument("--seed", type=int, default=42)
-    ap.add_argument("--persona", default="osim_passive",
+    ap.add_argument("--persona", default="osim_disengaged",
                     help="persona file stem under prompt_templates/personas/")
     ap.add_argument("--conds", default="A_system_only",
                     help="comma-separated subset of conditions to run")

@@ -36,19 +36,10 @@ You are tasked with being a teacher and helping a student with a math problem.
 {% endif %}
 
 You must not reveal the answer to the problem to the student at any point in time.
-Your task is to guide the student to have a complete understanding of the problem.
+Your task is to engage the student to have a complete understanding of the problem.
 Even if the student is already able to solve the problem, you should help them understand and improve the solution so that they get as high of a grade as possible.
 
 If possible, do not respond with overly long responses to the student.
-
-{% if include_thinking %}
-In order to be able to think of a good hint or approach for the student without revealing steps of the final solution, you can wrap your internal reasoning like this:
-<think>
-</think>
-[... example of think-tag usage ...]
-{% endif %}
-
-You can end a conversation by writing <end_of_conversation>, please try to end conversations as soon as they are finished instead of prolonging them if not needed. But do not end them prematurely either.
 
 Here is the math problem:
 {{ problem }}
@@ -305,3 +296,68 @@ using the neutral prompts instead.
   variance with zero tutor signal). Not used until the passive run is done.
 - `prompt_templates/personas/simple_student.txt` -- TutorRL's always-engaged
   baseline student. Unrelated to OSIM.
+
+---
+
+# CURRENT STATE (v3 run) — prompts and reward in one place
+
+Supersedes the sections above where they disagree. This is what
+`config/train_rl/osim_qwen3.yaml` actually runs.
+
+## The five prompts in the training loop
+
+| # | slot | file / symbol | notes |
+|---|------|---------------|-------|
+| 1 | tutor system | `prompt_templates/teacher_prompt_with_solution.txt` | TutorRL's prompt + a `{% if reference_solution %}` block. The worked solution is visible to the TEACHER ONLY -- never the student, never either judge. `use_thinking=false`, and the teacher engine sets `enable_thinking=false` (Qwen3 is a hybrid reasoner; leaving both on truncated 33% of turns and leaked reasoning on 24%). |
+| 2 | student system | `prompt_templates/personas/osim_disengaged.txt` + the problem appended | Problem enters via the system slot (design A). OSIM generates the `assistant` role; the tutor is `user`. |
+| 3 | per-turn judge | `judge_rewards.py::ENGAGEMENT_SYSTEM_PROMPT` | scores EVERY student turn on behavioral / affective / cognitive / learning_evidence (0-4 each) + a role_drift flag. gpt-oss-20b. |
+| 4 | terminal judge | `judge_rewards.py::LEARNING_SYSTEM_PROMPT` | scores the WHOLE dialogue on solution_progress / understanding / misconception_repair / independence (0-4) + a tutor_leaked flag. gpt-oss-20b. |
+| 5 | teacher stop-strings | `train_engagement_classroom.py::sampling_params_teacher` | blocks the v1 reward hack where the tutor scripted fake "User:" turns. |
+
+Eval adds the leakage + pedagogy binary judges and the neutral knowledge-probe
+prompts (sections 6-8 above); training uses none of them.
+
+## The reward function (per-turn path, `train.per_turn_rewards: true`)
+
+For each STUDENT turn t, with the teacher turn that elicited it credited the same value:
+
+    r_t = w_L * (learning_evidence_t / 4)          w_L = learning_weight   = 1.0
+        + w_E * ((behavioral+affective+cognitive)_t / 12)   w_E = engagement_weight = 0.5
+
+    G_t = r_t
+        + w_T * learning_scalar(terminal_4dim)      w_T = terminal_weight  = 1.0
+        + w_len * (n_student_turns / (max_turns//2))  w_len = length_weight = 0.5
+
+    A_t = G_t - mean over the 8 GRPO group members' G_t AT THE SAME TURN INDEX
+    advantage[token] = A_{turn_id[token]}          -> (B, T) tensor
+
+Notes that matter:
+- gamma = 0. Each teacher turn is judged only by the student turn it directly
+  elicited; there is no discounted return.
+- The terminal and length terms are CONSTANT within a dialogue, so they survive
+  the per-turn-index baseline only as variation BETWEEN group members -- i.e.
+  they act as trajectory-level signals without disturbing within-dialogue
+  ordering.
+- A dialogue is teacher-first AND teacher-last, so the final teacher turn
+  elicits no student turn and correctly receives advantage 0.
+- Turn indices reached by fewer than `per_turn_min_group` (4) group members
+  fall back to the trajectory-level advantage; with one member the baseline
+  makes the advantage identically zero.
+- `leak_multiplier` is 1.0 (gate OFF). Leakage is still penalised, but only
+  through the rubrics: the terminal EVIDENCE RULE, and the per-turn
+  learning_evidence anchor "if the tutor already stated the answer or the full
+  step, the student repeating it scores 0-1".
+- NOT used in the per-turn path: the participation gate and the leak gate, both
+  trajectory-level multipliers that cannot be attributed to a single turn.
+
+## Measured behaviour of this reward (v3, 168 steps)
+
+| window | leak | terminal | evidence | engagement | r_t | turns |
+|--------|-----:|---------:|---------:|-----------:|----:|------:|
+| first  | 0.475| 0.019    | 0.031    | 0.281      |0.200| 2.29  |
+| last   | 0.257| 0.015    | 0.031    | 0.281      |0.197| 2.02  |
+
+Leak halved; nothing else moved. Leakage is the only component that is both
+tutor-controllable and consistently signed (not leaking is worth +0.037 r_t
+within-group), so GRPO integrates it while the larger, student-driven variance
+in the other components averages out.

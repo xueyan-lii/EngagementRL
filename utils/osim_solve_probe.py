@@ -155,7 +155,7 @@ def main():
     args = ap.parse_args()
 
     personas = {
-        "passive": read_template("personas/osim_passive.txt").render(),
+        "disengaged": read_template("personas/osim_disengaged.txt").render(),
         "engaged": read_template("personas/osim_engaged.txt").render(),
     }
     tpl_initial = read_template("osim_initial_attempt_prompt.txt")
@@ -257,7 +257,7 @@ def main():
     for k, a in summary["by_difficulty"].items():
         print(f"{k:<48}{a['n']:>6}{a['boxed_rate']:>8}{a['correct_rate']:>9}")
     print(f"\nFull records -> {args.out}")
-    print("Read ~20 `volunteer_passive` transcripts by hand: has_work is a "
+    print("Read ~20 `volunteer_disengaged` transcripts by hand: has_work is a "
           "regex screen, not a judgement of whether a real solution was given.")
 
 

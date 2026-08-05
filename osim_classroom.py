@@ -77,7 +77,7 @@ class OsimEngagementClassroom(EngagementClassroom):
         model_save_path,
         engagement_model_cfg,
         log_file_path: str = None,
-        persona_path: str = "prompt_templates/personas/osim_passive.txt",
+        persona_path: str = "prompt_templates/personas/osim_disengaged.txt",
     ):
         # Skip EngagementClassroom.__init__ (it hard-wires UserLM's BOS shim,
         # end-token ids and stop_token_ids); go straight to the base class for

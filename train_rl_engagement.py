@@ -186,6 +186,17 @@ def main(cfg: TrainEngagementRLConfig):
         logger.info(f"Last checkpoint: {last_ckpt}")
 
     logger.info("Training...")
+    # Per-turn credit assignment needs a channel to the server's ragged per-turn
+    # rewards; TRL's reward_funcs interface only returns scalars. Without this
+    # the trainer silently falls back to trajectory-level advantages.
+    if cfg.train.per_turn_rewards:
+        trainer.per_turn_reward_fn = construct_per_turn_reward_fn(
+            cfg.generation.server_port
+        )
+        logger.info("Per-turn credit assignment ENABLED")
+    else:
+        logger.info("Per-turn credit assignment disabled (trajectory-level)")
+
     train_results = trainer.train(resume_from_checkpoint=last_ckpt)
     logger.info("Training complete!")
     logger.info(train_results)

@@ -496,36 +496,32 @@ class ClassroomGRPOTrainer(Trainer):
     # Mask user turns, used for multi-turn RL Training
     ####################################################################################
     def _per_turn_advantage_lists(self, ragged_rewards, fallback_advantages):
-        """Baseline each turn against the SAME turn index across its GRPO group.
+        """Baseline every turn against the POOLED mean over all turns of all
+        rollouts in the GRPO group.
 
-        ragged_rewards: list (len B_gathered) of per-student-turn reward lists.
-        Returns a list of per-turn ADVANTAGE lists, same ragged shape.
+        Was per-turn-INDEX: baseline turn t against turn t of the group's other
+        members. That controls for turn position, but position bias is modest
+        (mean r_t 0.166 at turn 0 rising to 0.313 by turn 5) while the small-n
+        problem is severe -- late indices are reached by only a handful of
+        members, and with one member the advantage is identically zero, which
+        silently kills the gradient on late turns.
 
-        Dialogues in a group end at different turns, so late indices may have
-        only one or two members to baseline against. Below `min_group_at_index`
-        members the baseline is meaningless (with one member the advantage is
-        identically 0, silently killing the gradient on late turns), so those
-        fall back to the trajectory-level advantage for that sample.
+        Pooling gives a far more stable baseline. Its cost is that turns at
+        positions scoring above the pooled mean get positive advantage
+        regardless of quality, which biases toward longer dialogues -- the
+        direction wanted here, and why the separate length term is gone.
         """
-        min_members = getattr(self.args, "per_turn_min_group", 4)
         G = self.num_generations
         out = [list(r) for r in ragged_rewards]
         for g0 in range(0, len(out), G):
             group = out[g0:g0 + G]
-            if not group:
+            pooled = [v for r in group for v in r]
+            if not pooled:
                 continue
-            max_turns = max((len(r) for r in group), default=0)
-            for t in range(max_turns):
-                vals = [r[t] for r in group if len(r) > t]
-                if len(vals) >= min_members:
-                    m = sum(vals) / len(vals)
-                    for j, r in enumerate(group):
-                        if len(r) > t:
-                            r[t] = r[t] - m
-                else:
-                    for j, r in enumerate(group):
-                        if len(r) > t:
-                            r[t] = float(fallback_advantages[g0 + j])
+            m = sum(pooled) / len(pooled)
+            for r in group:
+                for t in range(len(r)):
+                    r[t] = r[t] - m
         return out
 
     def _scatter_per_turn_advantages(self, completion_ids, adv_lists):
@@ -549,25 +545,35 @@ class ClassroomGRPOTrainer(Trainer):
                 if n_turns:
                     n_empty += 1
                 continue
-            if len(advs) != n_turns:
+            # A GUIDED dialogue is teacher-first AND teacher-last
+            # (T S T S ... T), so the trailing teacher turn elicits no student
+            # turn and correctly has no reward: n_turns == len(advs) + 1 is the
+            # NORMAL case, not a mismatch. That turn gets advantage 0 below --
+            # crediting it with the previous turn's reward would attribute a
+            # student response it never caused.
+            if n_turns - len(advs) not in (0, 1):
                 n_mismatch += 1
                 if worst is None or abs(len(advs) - n_turns) > abs(worst[0] - worst[1]):
                     worst = (len(advs), n_turns)
             a = torch.tensor(advs, dtype=torch.float32, device=out.device)
             tb = turn_ids[b]
             valid = tb >= 0
-            # Turns beyond the reward list (e.g. a truncated final turn) clamp
-            # to the last available value rather than indexing out of range.
+            # Turns beyond the reward list get advantage 0 (no credit), not the
+            # last turn's value: the trailing teacher turn caused no student
+            # response, so there is nothing to credit or penalise it for.
+            in_range = valid & (tb < len(advs))
             idx = tb.clamp(min=0, max=len(advs) - 1)
-            out[b] = torch.where(valid, a[idx], torch.zeros_like(out[b]))
+            out[b] = torch.where(in_range, a[idx], torch.zeros_like(out[b]))
         if n_mismatch or n_empty:
             logger.warning(
                 "PER-TURN REWARD MISALIGNMENT: %d/%d dialogues have a different "
                 "number of per-turn rewards than teacher turns in the tokenised "
                 "completion (worst: %s rewards vs %s turns); %d have turns but no "
-                "rewards. Advantages for the surplus turns are clamped to the last "
-                "available value, so credit lands on the wrong turn. Usually means "
-                "a dialogue was cut by generation.max_tokens_in_conversation.",
+                "rewards. Turns with no reward get advantage 0, so those tokens "
+                "contribute nothing to the gradient. One surplus teacher turn is "
+                "NORMAL (teacher-last dialogue) and is not counted here; a larger "
+                "gap usually means the dialogue was cut by "
+                "generation.max_tokens_in_conversation.",
                 n_mismatch, len(adv_lists),
                 worst[0] if worst else "-", worst[1] if worst else "-", n_empty,
             )

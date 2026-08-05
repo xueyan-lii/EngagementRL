@@ -23,14 +23,11 @@ OUT=${OUT:-logs/judged}
 # name|teacher|simulator|simulator_model|persona
 CELLS_ALL=(
   "tutorrl_userlm|eth-nlped/TutorRL-7B|userlm|microsoft/UserLM-8b|"
-  "tutorrl_osim-passive|eth-nlped/TutorRL-7B|osim|cmu-lti/osim-8b|prompt_templates/personas/osim_passive.txt"
-  "tutorrl_osim-diseng|eth-nlped/TutorRL-7B|osim|cmu-lti/osim-8b|prompt_templates/personas/osim_disengaged.txt"
+  "tutorrl_osim|eth-nlped/TutorRL-7B|osim|cmu-lti/osim-8b|prompt_templates/personas/osim_disengaged.txt"
   "qwen25-7b_userlm|Qwen/Qwen2.5-7B-Instruct|userlm|microsoft/UserLM-8b|"
-  "qwen25-7b_osim-passive|Qwen/Qwen2.5-7B-Instruct|osim|cmu-lti/osim-8b|prompt_templates/personas/osim_passive.txt"
-  "qwen25-7b_osim-diseng|Qwen/Qwen2.5-7B-Instruct|osim|cmu-lti/osim-8b|prompt_templates/personas/osim_disengaged.txt"
+  "qwen25-7b_osim|Qwen/Qwen2.5-7B-Instruct|osim|cmu-lti/osim-8b|prompt_templates/personas/osim_disengaged.txt"
   "qwen3-8b_userlm|Qwen/Qwen3-8B|userlm|microsoft/UserLM-8b|"
-  "qwen3-8b_osim-passive|Qwen/Qwen3-8B|osim|cmu-lti/osim-8b|prompt_templates/personas/osim_passive.txt"
-  "qwen3-8b_osim-diseng|Qwen/Qwen3-8B|osim|cmu-lti/osim-8b|prompt_templates/personas/osim_disengaged.txt"
+  "qwen3-8b_osim|Qwen/Qwen3-8B|osim|cmu-lti/osim-8b|prompt_templates/personas/osim_disengaged.txt"
 )
 
 # Kill only THIS script's leftover engines, by PID lineage. Never match on

@@ -59,7 +59,7 @@ reward_model:
   model_name_or_path: "Answer"
 
 simulator: userlm
-persona_path: prompt_templates/personas/osim_passive.txt
+persona_path: prompt_templates/personas/osim_disengaged.txt
 run_name: judged
 out_dir: logs/judged
 

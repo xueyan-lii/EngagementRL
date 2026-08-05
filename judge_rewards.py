@@ -2,12 +2,12 @@
 
 Two judge calls (both gpt-oss-20b, transcript-only):
   1. PER-TURN engagement: the validated 3-dim rubric from engagement_eval
-     (behavioral/affective/cognitive, 0-4 anchored) plus a 4th per-turn
-     LEARNING EVIDENCE dimension (new correct student-produced reasoning).
-  2. TERMINAL learning outcome: 4-dim dialogue-level rubric
-     (solution progress / understanding / misconception repair / independence)
-     with an evidence rule (tutor-stated answers score 0 -> leakage gets no
-     learning credit) and a delta rule (score change, not ability).
+     (behavioral/affective/cognitive).
+  2. PER-TURN learning outcome: 3-dim rubric (solution progress /
+     understanding / misconception repair), scored on the same
+     dialogue-so-far + target-turn view as the engagement judge. Leakage is
+     penalised inside solution_progress (a tutor-stated answer scores 0) and
+     flagged separately via tutor_leaked.
 
 Scalars are normalized to [0,1]; weighting happens in the trainer.
 """
@@ -15,7 +15,7 @@ import json
 import re
 
 # ---------------------------------------------------------------------------
-# Per-turn prompt: engagement (validated rubric, verbatim) + learning evidence
+# Per-turn prompt: engagement (validated rubric, verbatim)
 # ---------------------------------------------------------------------------
 
 ENGAGEMENT_SYSTEM_PROMPT = """\
@@ -25,56 +25,30 @@ including one STUDENT turn (the "target turn"). Rate the engagement expressed by
 the student IN THE TARGET TURN, given the conversation so far.
 
 Engagement is a multidimensional construct. Score three dimensions independently. \
-Judge ONLY the student. Ignore the tutor's quality. Do NOT reward fluency, \
-verbosity, politeness, or mere compliance -- a long, polite, but empty turn is \
-NOT engaged. Productive confusion ("wait, why does that work?") counts as \
+Judge ONLY the student. Ignore the tutor's quality. Productive confusion counts as \
 ENGAGED, not disengaged; only checking-out counts as disengaged.
 
 === BEHAVIORAL (participation & persistence) ===
-4  Actively drives the interaction forward: attempts the step, asks to keep
-   going, volunteers work unprompted.
+4  Actively drives the interaction forward: attempts the step, asks to keep going, volunteers work unprompted, shows increased interest in the topic, ask for related concepts.
 3  Participates substantively in response to each tutor prompt; stays on task.
-2  Passive compliance: minimal responses ("ok", "sure", "next"), does the
-   least required.
-1  Withdrawing: demands the answer instead of working, signals wanting to stop,
-   terse dead-end replies.
-0  Disengaged/absent: refuses to continue, off-task, or ends the conversation.
+2  Answers technical tutor questions, albeit simply.
+1  Passive compliance: minimal responses ("ok", "sure", "next"), demonstrate some engagement with the topic.
+0  Disengaged/absent: demands the answer instead of working, signals wanting to stop,
+   terse dead-end replies, refuses to continue, off-task, or ends the conversation.
 
 === AFFECTIVE (interest vs. boredom/frustration) ===
 4  Positive interest/curiosity ("oh interesting", "so is it because...?").
 3  Willing, neutral-positive tone.
 2  Flat/neutral affect.
-1  Negative but still present: boredom, impatience, or frustration WHILE still
-   trying. (Frustration + effort belongs here, not 0.)
+1  Negative but still present: boredom, impatience, or frustration WHILE still trying. (Frustration + effort belongs here, not 0.)
 0  Strong disengaged affect: annoyed/dismissive, "this is pointless", checked out.
 
 === COGNITIVE (depth of processing) ===
-4  Interactive: integrates the tutor's hint into the student's own reasoning;
-   co-constructs, builds a genuine back-and-forth on the idea.
-3  Constructive: generates NEW reasoning beyond what was given -- a justification,
-   an inference, a genuine conceptual question, an unprompted step.
-2  Active: manipulates given material -- plugs in numbers, restates or repeats the
-   tutor's step, picks from options.
+4  Interactive: integrates the tutor's hint into the student's own reasoning; co-constructs, builds a genuine back-and-forth on the idea.
+3  Constructive: generates NEW reasoning beyond what was given -- a justification, an inference, a genuine conceptual question, an unprompted step.
+2  Active: manipulates given material -- plugs in numbers, attempts the tutor's question, picks from options.
 1  Passive: only receives/acknowledges ("got it", "I see") with no processing.
 0  None: ignores the tutor's content, or just re-demands the answer.
-
-=== LEARNING EVIDENCE (new understanding shown in THIS turn) ===
-Score whether the target turn contains NEW, CORRECT, student-produced reasoning
-that was not present earlier in the dialogue. Credit only what the STUDENT
-produces. Content merely restated from the tutor scores at most 1. If the tutor
-already stated the answer or the full step, the student repeating it scores 0-1
-regardless of correctness.
-4  New correct reasoning: an unprompted correct step, a correct self-explanation
-   of WHY something works, or spotting and fixing their own earlier error.
-3  Correct completion of a step the tutor set up, with some student
-   transformation (own words, own algebra), beyond copying.
-2  Correct mechanical application: plugs numbers into a method just shown;
-   right answer, no visible understanding beyond execution.
-1  Attempted but incorrect new work, or verbatim echo of the tutor.
-0  No new content: acknowledgment, question, off-task, or repeats an earlier
-   error.
-For learning_evidence you MUST include a short verbatim quote from the target
-turn as evidence; if no quote supports a score above 0, the score is 0.
 
 === ROLE CHECK ===
 The "student" is a simulated user and occasionally malfunctions by slipping
@@ -86,40 +60,26 @@ working on their own problem, set drift=true. A student legitimately doing the
 math (even a full solution attempt in their own voice) is NOT drift.
 
 For EACH dimension, give a one-clause rationale, then the score. If the target
-turn is empty or pure silence, all four scores are 0.
+turn is empty or pure silence, all three scores are 0.
 
 Return ONLY this JSON object and nothing else:
 {"behavioral": {"rationale": "...", "score": N},
  "affective": {"rationale": "...", "score": N},
  "cognitive": {"rationale": "...", "score": N},
- "learning_evidence": {"quote": "...", "rationale": "...", "score": N},
  "role_drift": {"rationale": "...", "drift": true_or_false}}"""
 
-ENGAGEMENT_DIMS = ("behavioral", "affective", "cognitive", "learning_evidence")
+ENGAGEMENT_DIMS = ("behavioral", "affective", "cognitive")
 
 # ---------------------------------------------------------------------------
-# Terminal prompt: dialogue-level learning outcome
+# Turn-level learning outcome
 # ---------------------------------------------------------------------------
 
 LEARNING_SYSTEM_PROMPT = """\
-You are an expert in the learning sciences assessing LEARNING OUTCOMES from a
-completed one-on-one tutoring dialogue about a problem. You will see the
+You are an expert in the learning sciences annotating STUDENT engagement in a \
+one-on-one tutoring dialogue. You will see a dialogue transcript up to and \
+including one STUDENT turn (the "target turn"). You will see the
 problem, its ground-truth answer, and the full transcript. Assess how much the
-STUDENT demonstrably learned DURING the dialogue.
-
-Two strict rules:
-(1) EVIDENCE RULE: credit only what the student demonstrably produced or
-    articulated. A correct answer stated by the TUTOR is worth NOTHING, even if
-    the student says "got it" or repeats it. If you cannot quote student text
-    as evidence, the score is 0.
-(2) DELTA RULE: score learning (change during the dialogue), not ability. A
-    student who already solves the problem correctly at the start has shown
-    competence, not learning; score what changed relative to their first
-    attempt.
-(3) ROLE RULE: the student is simulated and may malfunction into an
-    AI-assistant persona (tutoring the tutor, numbered walkthroughs addressed
-    at the other party, "hope this helps"). Such turns are simulator noise:
-    credit NO learning from them on any dimension.
+STUDENT demonstrably learned in this turn.
 
 Additionally perform a LEAKAGE CHECK on the TUTOR: set leaked=true if the
 tutor gave away the solution rather than guiding the student to it -- e.g.
@@ -132,19 +92,18 @@ gradually are NOT leakage.
 Score four dimensions independently:
 
 === SOLUTION PROGRESS (student-produced progress on the problem) ===
-4  Student produces a complete correct solution largely by their own work.
-3  Student correctly executes the key step(s) they initially could not do.
+4  Student produces a complete correct solution after integrating previous steps.
+3  Student correctly executes the key step(s) they initially did wrong.
 2  Partial progress: some correct student-produced steps; gaps remain.
-1  Attempts exist but steps are wrong, or student merely transcribes what the
-   tutor dictates.
+1  Attempts exist but are wrong, or student merely repeats what the tutor dictates.
 0  No student-produced progress (including: correct answer present in the
    transcript but tutor-stated).
 
 === UNDERSTANDING DEMONSTRATED (depth, not correctness alone) ===
 4  Generalizes: articulates the underlying principle or when the method applies
    beyond this problem.
-3  Explains WHY a step works in their own words; connects steps.
-2  Applies a shown step correctly to new numbers but never justifies it.
+3  Explains WHY a step works; connects steps.
+2  Applies a shown step correctly to new numbers.
 1  Rote: repeats the tutor's words or steps without transformation.
 0  No comprehension evidence, or persistent misunderstanding.
 
@@ -152,33 +111,20 @@ Score four dimensions independently:
 First identify the student's initial error(s), if any.
 4  Student identifies their own earlier error and articulates the fix.
 3  Initial error is corrected IN THE STUDENT'S later work.
-2  Error acknowledged after the tutor flags it; weakly re-demonstrated.
-1  Error persists in modified form, or only the tutor corrects it.
+2  Error acknowledged after the tutor flags it; sensible fix attempted.
+1  Error persists in modified form.
 0  Initial errors unaddressed or repeated.
-If the student made no initial error, output score -1 (not applicable).
-
-=== INDEPENDENCE TRAJECTORY (scaffolding fading) ===
-4  Tutor support fades; student drives the final steps unprompted.
-3  Student needs progressively smaller hints for comparable steps.
-2  Constant level of tutor support throughout.
-1  Student needs increasing support, or offloads more over time.
-0  Tutor does essentially all the work end to end.
-
-For EACH dimension give one short student quote as evidence (or "" if none), a
-one-clause rationale, then the score.
 
 Return ONLY this JSON object and nothing else:
-{"solution_progress": {"quote": "...", "rationale": "...", "score": N},
- "understanding": {"quote": "...", "rationale": "...", "score": N},
- "misconception_repair": {"quote": "...", "rationale": "...", "score": N},
- "independence": {"quote": "...", "rationale": "...", "score": N},
+{"solution_progress": {"rationale": "...", "score": N},
+ "understanding": {"rationale": "...", "score": N},
+ "misconception_repair": {"rationale": "...", "score": N},
  "tutor_leaked": {"rationale": "...", "leaked": true_or_false}}"""
 
 LEARNING_DIMS = (
     "solution_progress",
     "understanding",
     "misconception_repair",
-    "independence",
 )
 
 # ---------------------------------------------------------------------------
@@ -212,13 +158,30 @@ def build_engagement_user_prompt(context_turns, target_text):
     return "\n".join(lines)
 
 
-def build_learning_user_prompt(problem, answer, turns):
-    """Full-dialogue user message for the terminal learning-outcome judge."""
+def build_learning_user_prompt(problem, answer, context_turns, target_text):
+    """PER-TURN user message for the learning judge: same shape as the
+    engagement prompt (dialogue so far + one target student turn), plus the
+    problem and ground-truth answer the learning rubric needs.
+
+    Was previously whole-dialogue and scored once at the end. Per-turn so it can
+    feed per-turn credit assignment, and because the terminal framing asked the
+    judge to score change "relative to the student's first attempt" -- an
+    artifact that does not exist at training time (no pre-dialogue probe is
+    computed, and GUIDED dialogues are teacher-first, so even the student's
+    first turn is already a response to tutoring)."""
+    ctx = context_turns
+    dropped = len(ctx) - MAX_CTX_TURNS
+    if dropped > 0:
+        ctx = ctx[-MAX_CTX_TURNS:]
     lines = [f"[PROBLEM]\n{problem}", f"\n[GROUND-TRUTH ANSWER]\n{answer}",
-             "\n[FULL TRANSCRIPT]"]
-    for m in turns:
+             "\n[DIALOGUE SO FAR]"]
+    if dropped > 0:
+        lines.append(f"(... {dropped} earlier turns omitted ...)")
+    for m in ctx:
         content = m["content"].strip() or "(says nothing and leaves)"
-        lines.append(f"{_ROLE_NAME[m['role']]}: {_trunc(content, 2000)}")
+        lines.append(f"{_ROLE_NAME[m['role']]}: {_trunc(content)}")
+    lines.append("\n[TARGET STUDENT TURN -- rate this]")
+    lines.append(f"Student: {_trunc(target_text)}")
     return "\n".join(lines)
 
 
@@ -229,7 +192,7 @@ def build_learning_user_prompt(problem, answer, turns):
 _JSON_RE = re.compile(r"\{(?:[^{}]|\{(?:[^{}]|\{[^{}]*\})*\})*\}", re.S)
 
 
-def _extract_scores(text, dims, allow_na=()):
+def _extract_scores(text, dims):
     for cand in reversed(_JSON_RE.findall(text)):
         try:
             obj = json.loads(cand)
@@ -241,8 +204,7 @@ def _extract_scores(text, dims, allow_na=()):
             out = {}
             for k in dims:
                 s = int(obj[k]["score"])
-                lo = -1 if k in allow_na else 0
-                if not lo <= s <= 4:
+                if not 0 <= s <= 4:
                     raise ValueError
                 out[k] = s
             # Optional judge-side drift flag (backstop to the rollout-time
@@ -266,23 +228,22 @@ def extract_engagement_scores(text):
 
 
 def extract_learning_scores(text):
-    return _extract_scores(text, LEARNING_DIMS, allow_na=("misconception_repair",))
+    return _extract_scores(text, LEARNING_DIMS)
 
 
 # Fallbacks when the judge fails to produce parsable JSON twice. Midpoint for
 # engagement (no fake advantage in either direction); conservative low for
 # learning evidence / outcome.
 DEFAULT_ENGAGEMENT_SCORES = {
-    "behavioral": 2, "affective": 2, "cognitive": 2, "learning_evidence": 1,
-    "role_drift": False,
+    "behavioral": 2, "affective": 2, "cognitive": 2, "role_drift": False,
 }
 DEFAULT_LEARNING_SCORES = {
-    "solution_progress": 1, "understanding": 1,
-    "misconception_repair": -1, "independence": 2,
+    "solution_progress": 1, "understanding": 1, "misconception_repair": 1,
     "tutor_leaked": False,
 }
 
 ZERO_ENGAGEMENT_SCORES = {**{k: 0 for k in ENGAGEMENT_DIMS}, "role_drift": False}
+ZERO_LEARNING_SCORES = {**{k: 0 for k in LEARNING_DIMS}, "tutor_leaked": False}
 
 
 # ---------------------------------------------------------------------------
@@ -328,14 +289,18 @@ def engagement_scalar(turn_scores, max_student_turns=None):
 
 
 def learning_scalar(scores):
-    """Mean of applicable dims / 4; misconception_repair==-1 is dropped."""
+    """Mean of the 3 learning dims / 4 -> [0,1].
+
+    misconception_repair no longer has an N/A (-1) escape: it was returned in
+    93% of dialogues (the student must first make an error for there to be one
+    to repair), so the dimension almost never contributed. It is now scored on
+    the same 0-4 scale as the others.
+    `independence` is gone: it scored 0 in 99% of dialogues because it is a
+    trajectory property ("scaffolding fades") that 2-turn dialogues cannot show.
+    """
     if scores is None:
         return 0.0
-    dims = [scores["solution_progress"], scores["understanding"],
-            scores["independence"]]
-    if scores["misconception_repair"] >= 0:
-        dims.append(scores["misconception_repair"])
-    return sum(dims) / (4.0 * len(dims))
+    return sum(scores[d] for d in LEARNING_DIMS) / (4.0 * len(LEARNING_DIMS))
 
 
 # ---------------------------------------------------------------------------
@@ -344,20 +309,15 @@ def learning_scalar(scores):
 # ---------------------------------------------------------------------------
 
 def judge_dialogues(run_batch, dialogues, problems, answers):
-    """Score completed dialogues with both training rubrics.
+    """Score completed dialogues with both rubrics, BOTH per student turn.
 
     run_batch: callable(list_of_chat_message_lists) -> list of raw text outputs.
-        Supplied by the caller so this stays free of any model/vLLM dependency.
-    dialogues: list of [{'role': 'teacher'|'student', 'content': str}], with
-        thinking already stripped (pass Conversation._get_hidden_conversation()).
+    dialogues: list of [{'role': 'teacher'|'student', 'content': str}] with
+        thinking already stripped.
 
-    Returns (turn_scores_per_dialogue, learning_scores_per_dialogue). The
-    per-turn engagement scores are computed because that is what the validated
-    rubric rates, but callers reporting eval metrics should aggregate them to
-    one number per dialogue via engagement_scalar() rather than reporting turns.
-
-    Unparsable judge outputs get one retry, then fall back to the same defaults
-    the training path uses, so a judge hiccup cannot silently skew a mean.
+    Returns (turn_scores, learning_turn_scores), each a per-dialogue list of
+    per-student-turn score dicts. Aggregate with per_turn_rewards() or the
+    scalars; do not report individual turns as a metric.
     """
     def _batch(messages, extractor, defaults):
         if not messages:
@@ -370,79 +330,75 @@ def judge_dialogues(run_batch, dialogues, problems, answers):
                 parsed[i] = extractor(t)
         return [p if p is not None else dict(defaults) for p in parsed]
 
-    # ---- per-turn engagement (aggregated by the caller) ----
-    eng_messages, slots = [], []
+    eng_msgs, lrn_msgs, slots = [], [], []
     turn_scores = [[] for _ in dialogues]
+    learning_turn_scores = [[] for _ in dialogues]
     for di, turns in enumerate(dialogues):
         for i, m in enumerate(turns):
             if m["role"] != "student":
                 continue
+            idx = len(turn_scores[di])
             if not m["content"].strip():
                 turn_scores[di].append(dict(ZERO_ENGAGEMENT_SCORES))
+                learning_turn_scores[di].append(dict(ZERO_LEARNING_SCORES))
                 continue
-            eng_messages.append([
+            eng_msgs.append([
                 {"role": "system", "content": ENGAGEMENT_SYSTEM_PROMPT},
                 {"role": "user",
                  "content": build_engagement_user_prompt(turns[:i], m["content"])},
             ])
-            slots.append((di, len(turn_scores[di])))
+            lrn_msgs.append([
+                {"role": "system", "content": LEARNING_SYSTEM_PROMPT},
+                {"role": "user", "content": build_learning_user_prompt(
+                    problems[di], answers[di], turns[:i], m["content"])},
+            ])
+            slots.append((di, idx))
             turn_scores[di].append(None)
+            learning_turn_scores[di].append(None)
 
-    for (di, idx), scores in zip(
-        slots, _batch(eng_messages, extract_engagement_scores,
-                      DEFAULT_ENGAGEMENT_SCORES)):
-        turn_scores[di][idx] = scores
-
-    # ---- terminal learning outcome ----
-    learn_messages = [
-        [{"role": "system", "content": LEARNING_SYSTEM_PROMPT},
-         {"role": "user", "content": build_learning_user_prompt(p, a, turns)}]
-        for p, a, turns in zip(problems, answers, dialogues)
-    ]
-    learning_scores = _batch(learn_messages, extract_learning_scores,
-                             DEFAULT_LEARNING_SCORES)
-    return turn_scores, learning_scores
+    for (di, idx), sc in zip(slots, _batch(eng_msgs, extract_engagement_scores,
+                                           DEFAULT_ENGAGEMENT_SCORES)):
+        turn_scores[di][idx] = sc
+    for (di, idx), sc in zip(slots, _batch(lrn_msgs, extract_learning_scores,
+                                           DEFAULT_LEARNING_SCORES)):
+        learning_turn_scores[di][idx] = sc
+    return turn_scores, learning_turn_scores
 
 
 # ---------------------------------------------------------------------------
 # Per-turn rewards (dense credit assignment)
 # ---------------------------------------------------------------------------
 
-def per_turn_rewards(turn_scores, learning_scores=None, learning_weight=1.0,
-                     engagement_weight=0.5, terminal_weight=1.0):
+def per_turn_rewards(turn_scores, learning_turn_scores=None,
+                     learning_weight=1.0, engagement_weight=0.5):
     """One reward per STUDENT turn, for per-turn credit assignment.
 
-        r_t = w_L * learning_evidence_t/4 + w_E * (beh+aff+cog)_t/12
-        G_t = r_t + w_T * learning_scalar(terminal)
+        r_t = w_L * ((solution_progress+understanding+misconception_repair)_t / 12)
+            + w_E * ((behavioral+affective+cognitive)_t / 12)
 
-    Both components are normalised to [0,1] before weighting (learning_evidence
-    is a 0-4 anchored scale; the three engagement dims are 0-4 each), so w_L and
-    w_E keep the meaning they have in the trajectory-level path.
+    Both rubrics are now scored PER TURN, so both components are 3 dims x 0-4
+    and divide by 12 to land in [0,1]; w_L and w_E therefore mean the same
+    thing as in the trajectory-level path.
 
-    Teacher turn t is credited with the STUDENT turn it elicited -- turn_scores
-    is positionally aligned with the student turns, and the trainer maps each
-    teacher turn to the same index.
+    Teacher turn t is credited with the STUDENT turn it elicited. turn_scores
+    and learning_turn_scores are positionally aligned with the student turns,
+    and the trainer maps each teacher turn to the same index.
 
-    The terminal 4-dim rubric is added as a CONSTANT to every turn rather than
-    folded into the last one. It measures things no single turn can express
-    (`independence` is explicitly a trajectory; `misconception_repair` is
-    cross-turn), and because it is identical across a dialogue's turns it
-    survives the per-turn-index group baseline only as variation BETWEEN group
-    members -- exactly the trajectory-level signal wanted, without disturbing
-    the within-dialogue ordering that the per-turn terms provide.
+    No terminal term: the learning rubric is per-turn now, so there is no
+    separate dialogue-level score to fold in. No length term: it was fighting
+    the learning signal (leaked dialogues run longer and collected more length
+    bonus, which outweighed the +0.019 evidence advantage of not leaking), and
+    turn-position credit is handled by the trainer's baseline instead.
 
-    Drift-flagged turns get 0.0 so they neither reward nor penalise, matching
-    engagement_scalar's treatment.
-
-    Returns a list of floats, one per entry in turn_scores.
+    Drift-flagged turns get 0.0 so they neither reward nor penalise.
     """
-    terminal = terminal_weight * learning_scalar(learning_scores) if learning_scores else 0.0
+    lts = learning_turn_scores or []
     out = []
-    for t in turn_scores:
+    for i, t in enumerate(turn_scores):
         if t.get("role_drift", False):
             out.append(0.0)
             continue
-        eng = (t["behavioral"] + t["affective"] + t["cognitive"]) / 12.0
-        learn = t.get("learning_evidence", 0) / 4.0
-        out.append(learning_weight * learn + engagement_weight * eng + terminal)
+        eng = sum(t[d] for d in ENGAGEMENT_DIMS) / 12.0
+        learn = learning_scalar(lts[i]) if i < len(lts) else 0.0
+        out.append(learning_weight * learn + engagement_weight * eng)
     return out

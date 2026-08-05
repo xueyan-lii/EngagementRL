@@ -23,7 +23,7 @@ Reported per dialogue, macro-averaged over problems:
 Usage (single cell):
   python eval_judged.py --config-name judged \\
       teacher_model.model_name_or_path=Qwen/Qwen3-8B \\
-      simulator=osim persona_path=prompt_templates/personas/osim_passive.txt \\
+      simulator=osim persona_path=prompt_templates/personas/osim_disengaged.txt \\
       run_name=qwen3-8b_osim-passive
 
 Sweep over all combinations: ./run_judged_sweep.sh
@@ -41,7 +41,8 @@ from omegaconf import OmegaConf
 from config.eval import EvalConfig
 from config.train_rl_model import StudentModelConfig
 from engagement_classroom import EngagementClassroom
-from judge_rewards import engagement_scalar, judge_dialogues, learning_scalar
+from judge_rewards import (LEARNING_DIMS, engagement_scalar, judge_dialogues,
+                           learning_scalar, per_turn_rewards)
 from osim_classroom import OsimEngagementClassroom
 from src.classroom import ConversationState, ConversationType
 from src.utils.utils import init_logger
@@ -60,7 +61,7 @@ class JudgedEvalConfig(EvalConfig):
         )
     )
     simulator: str = "userlm"           # "userlm" | "osim"
-    persona_path: str = "prompt_templates/personas/osim_passive.txt"
+    persona_path: str = "prompt_templates/personas/osim_disengaged.txt"
     run_name: str = "judged"
     out_dir: str = "logs/judged"
 
@@ -146,12 +147,17 @@ def main(cfg):
                                                 classroom.sampling_params_judge)]
 
     dialogues = [c._get_hidden_conversation() for c in conversations]
-    turn_scores, learning_scores = judge_dialogues(run_batch, dialogues, sp, sa)
+    turn_scores, learning_turn_scores = judge_dialogues(run_batch, dialogues, sp, sa)
 
     max_student_turns = max(1, cfg.generation.max_turns // 2)
     eng = [engagement_scalar(t, max_student_turns) for t in turn_scores]
-    learn = [learning_scalar(s) for s in learning_scores]
+    # Learning is per-turn now; report the dialogue mean over its student turns.
+    learn = [
+        (sum(learning_scalar(x) for x in lts) / len(lts)) if lts else 0.0
+        for lts in learning_turn_scores
+    ]
     flat = [t for ts in turn_scores for t in ts if not t.get("role_drift")]
+    flat_learn = [x for lts in learning_turn_scores for x in lts if x]
 
     res = {
         "run_name": cfg.run_name,
@@ -166,13 +172,11 @@ def main(cfg):
         "behavioral": _dim_mean(flat, "behavioral"),
         "affective": _dim_mean(flat, "affective"),
         "cognitive": _dim_mean(flat, "cognitive"),
-        "learning_evidence": _dim_mean(flat, "learning_evidence"),
-        "solution_progress": _dim_mean(learning_scores, "solution_progress"),
-        "understanding": _dim_mean(learning_scores, "understanding"),
-        "misconception_repair": _dim_mean(learning_scores, "misconception_repair", True),
-        "independence": _dim_mean(learning_scores, "independence"),
+        "solution_progress": _dim_mean(flat_learn, "solution_progress"),
+        "understanding": _dim_mean(flat_learn, "understanding"),
+        "misconception_repair": _dim_mean(flat_learn, "misconception_repair"),
         "leak_flag_rate": sum(s.get("tutor_leaked", False)
-                              for s in learning_scores) / len(learning_scores),
+                              for s in flat_learn) / max(1, len(flat_learn)),
         "disengage_rate": sum(getattr(c, "disengaged", False)
                               for c in conversations) / len(conversations),
         "avg_dialogue_msgs": sum(len(c.conversation)
@@ -186,7 +190,7 @@ def main(cfg):
             {"engagement": e, "learning": l, "leaked": s.get("tutor_leaked", False),
              "disengaged": getattr(c, "disengaged", False),
              "n_msgs": len(c.conversation)}
-            for e, l, s, c in zip(eng, learn, learning_scores, conversations)]}, f)
+            for e, l, s, c in zip(eng, learn, learning_turn_scores, conversations)]}, f)
     with open(os.path.join(cfg.out_dir, f"{cfg.run_name}_dialogues.jsonl"), "w") as f:
         for c, e, l in zip(conversations, eng, learn):
             f.write(json.dumps({"problem": c.problem, "answer": c.answer,
@@ -199,9 +203,9 @@ def main(cfg):
     print(f"  ENGAGEMENT        : {res['engagement']:.4f}")
     print(f"  LEARNING          : {res['learning']:.4f}")
     print(f"    beh {res['behavioral']:.2f} / aff {res['affective']:.2f} / "
-          f"cog {res['cognitive']:.2f} / evid {res['learning_evidence']:.2f}")
+          f"cog {res['cognitive']:.2f}")
     print(f"    progress {res['solution_progress']:.2f} / underst {res['understanding']:.2f} / "
-          f"miscon {res['misconception_repair']:.2f} / indep {res['independence']:.2f}")
+          f"miscon {res['misconception_repair']:.2f}")
     print(f"  disengage rate    : {res['disengage_rate']:.4f}")
     print(f"  avg dialogue msgs : {res['avg_dialogue_msgs']:.1f}")
     print(f"  leak flag (appendix): {res['leak_flag_rate']:.4f}")

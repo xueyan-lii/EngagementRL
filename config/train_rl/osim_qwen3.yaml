@@ -31,7 +31,7 @@
 # watch the ref-model allocation at step 1.
 
 simulator: osim
-persona_path: prompt_templates/personas/osim_passive.txt
+persona_path: prompt_templates/personas/osim_disengaged.txt
 
 train:
   number_of_problems_per_batch: 6   # x8 samples = 48 dialogues/step (divisible by 3 ranks)
@@ -109,9 +109,6 @@ reward:
   # ~70% of dialogues past one turn and was anti-correlated with engagement.
   # More load-bearing here than before, since the tutor now holds the solution.
   leak_multiplier: 1.0
-  # Weight on the terminal 4-dim rubric, added as a constant to every turn in
-  # the per-turn path (unused by the trajectory path).
-  terminal_weight: 1.0
 
 dataset:
   max_train_examples: -1
@@ -136,8 +133,8 @@ generation:
 logging:
   wandb: true
   wandb_project: engagement-rl
-  wandb_run_name: qwen3-8b-osim-passive-refsol-v2-nothink
+  wandb_run_name: qwen3-8b-osim-v4-perturn-learning
   run_group: osim
   wandb_tags: ["osim", "qwen3-8b", "refsol", "openr1"]
-  save_dir: checkpoints/osim_qwen3_v2
+  save_dir: checkpoints/osim_qwen3_v4
   save_steps: 40

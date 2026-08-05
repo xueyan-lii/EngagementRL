@@ -25,7 +25,7 @@ from pydantic import BaseModel
 from config.train_rl_engagement_model import TrainEngagementRLConfig
 from train_engagement_classroom import TrainEngagementClassroom
 from train_osim_classroom import TrainOsimClassroom
-from judge_rewards import learning_scalar
+from judge_rewards import ENGAGEMENT_DIMS, learning_scalar
 from src.classroom import Conversation
 from src.utils.utils import init_logger
 
@@ -74,13 +74,12 @@ def sample_conversations(request: ConversationSampleRequest):
     # rewards/<func> metrics no longer describe what is being optimised.
     def _mean(xs):
         return sum(xs) / len(xs) if xs else 0.0
-    pt_eng, pt_evid = [], []
+    pt_eng, pt_learn = [], []
     for c in conversations:
         kept = [t for t in c.turn_scores if not t.get("role_drift", False)]
-        pt_eng.append(_mean([(t["behavioral"] + t["affective"] + t["cognitive"]) / 12.0
-                             for t in kept]))
-        pt_evid.append(_mean([t.get("learning_evidence", 0) / 4.0 for t in kept]))
-    term = [learning_scalar(getattr(c, "learning_scores", None)) for c in conversations]
+        pt_eng.append(_mean([sum(t[d] for d in ENGAGEMENT_DIMS) / 12.0 for t in kept]))
+        lts = [x for x in getattr(c, "learning_turn_scores", []) if x]
+        pt_learn.append(_mean([learning_scalar(x) for x in lts]))
     dis = [c.disengaged for c in conversations]
     drift_trunc = sum(c.role_drifted for c in conversations)
     drift_resamples = sum(c.drift_resamples for c in conversations)
@@ -118,6 +117,7 @@ def sample_conversations(request: ConversationSampleRequest):
                         ),
                         "conversation": c.conversation,
                         "turn_scores": c.turn_scores,
+                        "learning_turn_scores": c.learning_turn_scores,
                         "learning_scores": c.learning_scores,
                         "engagement_reward": e,
                         "learning_reward": l,
@@ -135,7 +135,7 @@ def sample_conversations(request: ConversationSampleRequest):
         f"drift: {drift_resamples} resamples, {drift_trunc} truncated, "
         f"{judge_drift} judge-flagged turns, leaked {leaked}/{len(conversations)} | "
         f"components: per-turn eng {_mean(pt_eng):.3f}, "
-        f"per-turn evidence {_mean(pt_evid):.3f}, terminal {_mean(term):.3f}"
+        f"per-turn learning {_mean(pt_learn):.3f}"
     )
 
     if config.logging.wandb:
@@ -153,8 +153,7 @@ def sample_conversations(request: ConversationSampleRequest):
                 "server/judge_flagged_drift_turns": judge_drift,
                 "server/leak_rate": leaked / len(conversations),
                 "server/per_turn_engagement_mean": _mean(pt_eng),
-                "server/per_turn_learning_evidence_mean": _mean(pt_evid),
-                "server/terminal_rubric_mean": _mean(term),
+                "server/per_turn_learning_mean": _mean(pt_learn),
             }
         )
 
@@ -229,7 +228,7 @@ def main(cfg: TrainEngagementRLConfig):
         leak_multiplier=cfg.reward.leak_multiplier,
         learning_weight=cfg.reward.learning_weight,
         engagement_weight=cfg.reward.engagement_weight,
-        terminal_weight=cfg.reward.terminal_weight,
+
     )
     if simulator == "osim":
         logger.info(f"Simulator: OSIM (persona {cfg.persona_path})")

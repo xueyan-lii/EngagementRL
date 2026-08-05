@@ -31,10 +31,10 @@
 # watch the ref-model allocation at step 1.
 
 simulator: osim
-persona_path: prompt_templates/personas/osim_passive.txt
+persona_path: prompt_templates/personas/osim_disengaged.txt
 
 train:
-  number_of_problems_per_batch: 2   # x8 samples = 48 dialogues/step (divisible by 3 ranks)
+  number_of_problems_per_batch: 3   # x4 samples = 12 dialogues, divisible by 3 ranks
   num_samples_per_problem: 4        # GRPO group size
   per_device_train_batch_size: 1
 

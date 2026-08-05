@@ -26,7 +26,7 @@ Anything that resides in the think tags will not be visible to the student at al
 Make sure to always close your thinking and then output the actual message to the user in the same response!
 {% endif %}
 
-You can end a conversation by writing <end_of_conversation>, please try to end conversations as soon as they are finished instead of prolonging them if not needed. But do not end them prematurely either.
+You can end a conversation by writing <end_of_conversation>.
 
 Here is the math problem:
 {{ problem }}

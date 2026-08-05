@@ -50,7 +50,7 @@ import logging
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_PERSONA = "prompt_templates/personas/osim_passive.txt"
+DEFAULT_PERSONA = "prompt_templates/personas/osim_disengaged.txt"
 
 
 class TrainOsimClassroom(TrainEngagementClassroom):
